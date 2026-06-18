@@ -107,8 +107,9 @@ app.use(cors({
 // Rate limiting global
 app.use('/api/', apiLimiter);
 
-// Servir arquivos estáticos do frontend
-app.use(express.static(path.join(__dirname, '..', 'frontend', 'public')));
+// Servir arquivos estáticos do frontend (apenas se a pasta existir)
+const frontendPath = path.join(__dirname, '..', 'frontend', 'public');
+app.use(express.static(frontendPath));
 
 // ============= TRATAMENTO DE ERROS =============
 const handleError = (res, statusCode, message, error = null) => {
@@ -915,22 +916,16 @@ app.get('/api/chats', authMiddleware, async (req, res) => {
         connection = await pool.getConnection();
 
         const [chats] = await connection.query(`
-            SELECT DISTINCT
-                CASE 
-                    WHEN m.usuario_idusuario = ? THEN m.usuario_idusuario1
-                    ELSE m.usuario_idusuario
-                END AS idusuario_outro,
+            SELECT 
+                u.idusuario AS idusuario_outro,
                 u.primeironome,
                 MAX(m.dtmensagen) AS ultima_mensagem
             FROM mensagem m
-            JOIN usuario u ON u.idusuario = CASE 
-                    WHEN m.usuario_idusuario = ? THEN m.usuario_idusuario1
-                    ELSE m.usuario_idusuario
-                END
+            JOIN usuario u ON u.idusuario = (CASE WHEN m.usuario_idusuario = ? THEN m.usuario_idusuario1 ELSE m.usuario_idusuario END)
             WHERE m.usuario_idusuario = ? OR m.usuario_idusuario1 = ?
-            GROUP BY idusuario_outro, u.primeironome
+            GROUP BY u.idusuario, u.primeironome
             ORDER BY ultima_mensagem DESC
-        `, [req.user.idusuario, req.user.idusuario, req.user.idusuario, req.user.idusuario]);
+        `, [req.user.idusuario, req.user.idusuario, req.user.idusuario]);
 
         res.json(chats);
     } catch (error) {
@@ -1273,6 +1268,10 @@ if (require.main === module) {
 }
 
 module.exports = { app, processarFilasExpiradas };
+
+
+
+Expiradas };
 
 
 
