@@ -53,6 +53,20 @@ const normalizeState = (value) => {
     return brazilStateMap[state.toLowerCase()] || state.toUpperCase();
 };
 const normalizePhone = (value) => typeof value === 'string' ? value.replace(/\D/g, '') : '';
+const tableColumnExists = async (connection, tableName, columnName) => {
+    const [columns] = await connection.query(`SHOW COLUMNS FROM \`${tableName}\` LIKE ?`, [columnName]);
+    return columns.length > 0;
+};
+const getItemSchemaSupport = async (connection) => ({
+    hasPrazoDias: await tableColumnExists(connection, 'item', 'prazo_dias'),
+    hasDtCriacao: await tableColumnExists(connection, 'item', 'dtcriacao'),
+    hasDataDoacao: await tableColumnExists(connection, 'item', 'datadoacao')
+});
+const getItemDateExpression = ({ hasDtCriacao, hasDataDoacao }) => {
+    if (hasDtCriacao && hasDataDoacao) return 'COALESCE(i.dtcriacao, i.datadoacao)';
+    if (hasDtCriacao) return 'i.dtcriacao';
+    return 'i.datadoacao';
+};
 
 // ============= MIDDLEWARE DE SEGURANÇA =============
 app.use(helmet({
@@ -289,15 +303,9 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
             userLon = userRows[0].longitude;
         }
 
-        // Fallback para prazo_dias se a coluna não existir
-        let columns;
-        try {
-            [columns] = await connection.query('SHOW COLUMNS FROM item LIKE "prazo_dias"');
-        } catch (e) {
-            columns = [];
-        }
-        const hasPrazoDias = columns.length > 0;
-        const intervalExpr = hasPrazoDias ? 'i.prazo_dias' : '7';
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
+        const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
 
         const [itens] = await connection.query(`
             SELECT 
@@ -307,8 +315,8 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 i.latitude,
                 i.longitude,
                 u.primeironome,
-                COALESCE(i.dtcriacao, i.datadoacao) AS dtcriacao,
-                DATEDIFF(DATE_ADD(COALESCE(i.dtcriacao, i.datadoacao), INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes,
+                ${dateExpr} AS dtcriacao,
+                DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes,
                 (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila
             FROM item i
             JOIN usuario u ON i.usuario_idusuario = u.idusuario
@@ -354,7 +362,7 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
             descricao: escapeHtml(descricao?.trim() || ''),
             latitude: parseFloat(latitude),
             longitude: parseFloat(longitude),
-            prazo_dias: parseInt(prazo_dias) || 7
+            prazo_dias: Math.min(Math.max(parseInt(prazo_dias) || 7, 1), 15)
         };
 
         connection = await pool.getConnection();
@@ -367,10 +375,33 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
             return res.status(404).json({ erro: 'Usuário não encontrado' });
         }
 
-        const [result] = await connection.query(
-            'INSERT INTO item (titulo, descricao, dtcriacao, datadoacao, latitude, longitude, usuario_idusuario, prazo_dias) VALUES (?, ?, NOW(), NOW(), ?, ?, ?, ?)',
-            [itemData.titulo, itemData.descricao, itemData.latitude, itemData.longitude, req.user.idusuario, itemData.prazo_dias]
-        );
+        const itemSchema = await getItemSchemaSupport(connection);
+        const columns = ['titulo', 'descricao'];
+        const values = ['?', '?'];
+        const insertParams = [itemData.titulo, itemData.descricao];
+
+        if (itemSchema.hasDtCriacao) {
+            columns.push('dtcriacao');
+            values.push('NOW()');
+        }
+        if (itemSchema.hasDataDoacao) {
+            columns.push('datadoacao');
+            values.push('NOW()');
+        }
+
+        columns.push('latitude', 'longitude', 'usuario_idusuario');
+        values.push('?', '?', '?');
+        insertParams.push(itemData.latitude, itemData.longitude, req.user.idusuario);
+
+        if (itemSchema.hasPrazoDias) {
+            columns.push('prazo_dias');
+            values.push('?');
+            insertParams.push(itemData.prazo_dias);
+        }
+
+        const insertSql = `INSERT INTO item (${columns.join(', ')}) VALUES (${values.join(', ')})`;
+
+        const [result] = await connection.query(insertSql, insertParams);
 
         res.status(201).json({
             sucesso: true,
@@ -388,6 +419,8 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
         const [itens] = await connection.query(`
             SELECT 
                 i.iditem,
@@ -395,7 +428,7 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                 i.descricao,
                 i.latitude,
                 i.longitude,
-                COALESCE(i.dtcriacao, i.datadoacao) AS dtcriacao,
+                ${dateExpr} AS dtcriacao,
                 (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila,
                 (SELECT COUNT(*) FROM solicitacao s3 WHERE s3.item_iditem = i.iditem) AS total_solicitacoes
             FROM item i
@@ -523,6 +556,9 @@ app.get('/api/itens/:iditem/fila', authMiddleware, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
+        const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
         const [rows] = await connection.query(`
             SELECT posicao_fila, total, distancia_km, dias_restantes
             FROM (
@@ -536,7 +572,7 @@ app.get('/api/itens/:iditem/fila', authMiddleware, async (req, res) => {
                     )) AS distancia_km,
                     RANK() OVER (ORDER BY distancia_km ASC) AS posicao_fila,
                     COUNT(*) OVER () AS total,
-                    DATEDIFF(DATE_ADD(COALESCE(i.dtcriacao, i.datadoacao), INTERVAL i.prazo_dias DAY), NOW()) AS dias_restantes
+                    DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes
                 FROM solicitacao s
                 JOIN usuario u ON s.usuario_idusuario = u.idusuario
                 JOIN item i ON s.item_iditem = i.iditem
@@ -828,6 +864,8 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
 
         const [solicitacoes] = await connection.query(`
             SELECT 
@@ -852,7 +890,7 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
             SELECT
                 'doacao' as tipo,
                 i.iditem as id,
-                COALESCE(i.dtcriacao, i.datadoacao) as data,
+                ${dateExpr} as data,
                 'criada' as status,
                 i.titulo,
                 i.descricao,
@@ -915,6 +953,7 @@ app.get('/api/chats', authMiddleware, async (req, res) => {
     try {
         connection = await pool.getConnection();
 
+        // Consulta robusta que funciona em MySQL 5.7 e 8.0 (evita problemas de ONLY_FULL_GROUP_BY)
         const [chats] = await connection.query(`
             SELECT 
                 u.idusuario AS idusuario_outro,
@@ -927,8 +966,9 @@ app.get('/api/chats', authMiddleware, async (req, res) => {
             ORDER BY ultima_mensagem DESC
         `, [req.user.idusuario, req.user.idusuario, req.user.idusuario]);
 
-        res.json(chats);
+        res.json(chats || []);
     } catch (error) {
+        console.error('Erro na rota /api/chats:', error);
         handleError(res, 500, 'Erro ao carregar chats', error);
     } finally {
         if (connection) connection.release();
@@ -1159,24 +1199,17 @@ async function processarFilasExpiradas() {
     let connection;
     try {
         connection = await pool.getConnection();
-        // Fallback para prazo_dias se a coluna não existir
-        let columns;
-        try {
-            [columns] = await connection.query('SHOW COLUMNS FROM item LIKE "prazo_dias"');
-        } catch (e) {
-            columns = [];
-        }
-        
-        const hasPrazoDias = columns.length > 0;
-        const intervalExpr = hasPrazoDias ? 'INTERVAL i.prazo_dias DAY' : 'INTERVAL 7 DAY';
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
+        const intervalExpr = itemSchema.hasPrazoDias ? 'INTERVAL i.prazo_dias DAY' : 'INTERVAL 7 DAY';
 
         const [itensExpirados] = await connection.query(`
-            SELECT i.iditem, i.usuario_idusuario, ${hasPrazoDias ? 'i.prazo_dias,' : '7 AS prazo_dias,'}
-                COALESCE(i.dtcriacao, i.datadoacao) AS dtcriacao,
+            SELECT i.iditem, i.usuario_idusuario, ${itemSchema.hasPrazoDias ? 'i.prazo_dias,' : '7 AS prazo_dias,'}
+                ${dateExpr} AS dtcriacao,
                 u_item.latitude AS lat_item, u_item.longitude AS lon_item
             FROM item i
             JOIN usuario u_item ON i.usuario_idusuario = u_item.idusuario
-            WHERE COALESCE(i.dtcriacao, i.datadoacao) <= DATE_SUB(NOW(), ${intervalExpr})
+            WHERE ${dateExpr} <= DATE_SUB(NOW(), ${intervalExpr})
               AND EXISTS (
                 SELECT 1 FROM solicitacao s 
                 WHERE s.item_iditem = i.iditem AND s.status = 'pendente'
@@ -1268,10 +1301,4 @@ if (require.main === module) {
 }
 
 module.exports = { app, processarFilasExpiradas };
-
-
-
-Expiradas };
-
-
 
