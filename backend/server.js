@@ -22,6 +22,12 @@ if (missingEnv.length > 0) {
     console.warn(message);
 }
 
+const isProduction = process.env.NODE_ENV === 'production';
+if (!isTest && process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
+    console.error('JWT_SECRET must have at least 32 characters.');
+    process.exit(1);
+}
+
 // Importações de módulos de segurança
 const authMiddleware = require('./middleware/authMiddleware');
 const { loginLimiter, apiLimiter } = require('./middleware/rateLimiter');
@@ -53,6 +59,11 @@ const normalizeState = (value) => {
     return brazilStateMap[state.toLowerCase()] || state.toUpperCase();
 };
 const normalizePhone = (value) => typeof value === 'string' ? value.replace(/\D/g, '') : '';
+const clampInteger = (value, fallback, min, max) => {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isNaN(parsed)) return fallback;
+    return Math.min(Math.max(parsed, min), max);
+};
 const tableColumnExists = async (connection, tableName, columnName) => {
     const [columns] = await connection.query(`SHOW COLUMNS FROM \`${tableName}\` LIKE ?`, [columnName]);
     return columns.length > 0;
@@ -60,12 +71,60 @@ const tableColumnExists = async (connection, tableName, columnName) => {
 const getItemSchemaSupport = async (connection) => ({
     hasPrazoDias: await tableColumnExists(connection, 'item', 'prazo_dias'),
     hasDtCriacao: await tableColumnExists(connection, 'item', 'dtcriacao'),
-    hasDataDoacao: await tableColumnExists(connection, 'item', 'datadoacao')
+    hasDataDoacao: await tableColumnExists(connection, 'item', 'datadoacao'),
+    hasLimiteFila: await tableColumnExists(connection, 'item', 'limite_fila'),
+    hasImagemUrl: await tableColumnExists(connection, 'item', 'imagem_url')
 });
 const getItemDateExpression = ({ hasDtCriacao, hasDataDoacao }) => {
     if (hasDtCriacao && hasDataDoacao) return 'COALESCE(i.dtcriacao, i.datadoacao)';
     if (hasDtCriacao) return 'i.dtcriacao';
     return 'i.datadoacao';
+};
+const getItemQueueLimitExpression = ({ hasLimiteFila }) => hasLimiteFila ? 'COALESCE(i.limite_fila, 10)' : '10';
+const getItemImageExpression = ({ hasImagemUrl }) => hasImagemUrl ? 'i.imagem_url' : 'NULL';
+
+const normalizeItemPayload = (body = {}) => {
+    const titulo = normalizeString(body.titulo || body.title);
+    const descricao = typeof body.descricao === 'string' ? body.descricao.trim() : '';
+    const latitude = Number.parseFloat(body.latitude);
+    const longitude = Number.parseFloat(body.longitude);
+    const limiteFila = clampInteger(body.limiteFila ?? body.limite_fila, 10, 1, 15);
+    const prazoDias = clampInteger(body.prazo_dias ?? body.prazoDias, 7, 1, 15);
+    const imagemUrl = normalizeString(body.imagem_url || body.imagemUrl || '');
+
+    return {
+        titulo,
+        descricao,
+        latitude,
+        longitude,
+        limite_fila: limiteFila,
+        prazo_dias: prazoDias,
+        imagem_url: imagemUrl
+    };
+};
+
+const calculateQueueCandidates = (item, candidatos) => candidatos
+    .map((candidato) => ({
+        ...candidato,
+        distancia_km: calcularDistancia(
+            Number(item.latitude),
+            Number(item.longitude),
+            Number(candidato.latitude),
+            Number(candidato.longitude)
+        )
+    }))
+    .sort((a, b) => {
+        if (a.distancia_km !== b.distancia_km) return a.distancia_km - b.distancia_km;
+        return new Date(a.datarequisicao) - new Date(b.datarequisicao);
+    });
+
+const cleanupExpiredPasswordResetTokens = () => {
+    const now = Date.now();
+    for (const [token, record] of passwordResetTokens.entries()) {
+        if (!record || record.expires < now) {
+            passwordResetTokens.delete(token);
+        }
+    }
 };
 
 // ============= MIDDLEWARE DE SEGURANÇA =============
@@ -91,7 +150,7 @@ app.get('/health', (req, res) => {
 });
 
 // CORS restritivo
-const defaultAllowedOrigins = [
+const defaultAllowedOrigins = isProduction ? [] : [
     'http://localhost:3000',
     'http://localhost:3001',
     'http://127.0.0.1:5500',
@@ -104,7 +163,7 @@ console.log('✓ Allowed CORS origins:', allowedOrigins);
 app.use(cors({
     origin: (origin, callback) => {
         const requestedOrigin = typeof origin === 'string' ? origin.trim() : origin;
-        const isLocalhostOrigin = typeof requestedOrigin === 'string' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestedOrigin);
+        const isLocalhostOrigin = !isProduction && typeof requestedOrigin === 'string' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestedOrigin);
 
         // Permite requests sem origin (ex: ferramentas de teste ou servidores de mesmo host)
         if (!requestedOrigin || allowedOrigins.includes(requestedOrigin) || isLocalhostOrigin) {
@@ -187,6 +246,8 @@ app.post('/api/login', isTest ? (req, res, next) => next() : loginLimiter, async
 app.post('/api/usuarios', async (req, res) => {
     let connection;
     try {
+        // Extrair senha ANTES de sanitizar para evitar corrupção por escapeHtml
+        const senhaRaw = typeof req.body?.senha === 'string' ? req.body.senha : '';
         const body = sanitizeObject(req.body || {});
         const {
             primeironome = '',
@@ -201,9 +262,9 @@ app.post('/api/usuarios', async (req, res) => {
             logradouro = '',
             numero = '',
             latitude,
-            longitude,
-            senha = ''
+            longitude
         } = body;
+        const senha = senhaRaw;
 
         // Validações rigorosas
         const validationResults = {
@@ -245,13 +306,20 @@ app.post('/api/usuarios', async (req, res) => {
 
         // Verificar duplicação
         connection = await pool.getConnection();
-        const [existing] = await connection.query(
-            'SELECT idusuario FROM usuario WHERE email = ? OR cpf = ?',
-            [userData.email, userData.cpf]
+        const [existingEmail] = await connection.query(
+            'SELECT idusuario FROM usuario WHERE email = ?',
+            [userData.email]
         );
+        if (existingEmail.length > 0) {
+            return res.status(409).json({ erro: 'Email já cadastrado' });
+        }
 
-        if (existing.length > 0) {
-            return res.status(400).json({ erro: 'Email ou CPF já cadastrado' });
+        const [existingCpf] = await connection.query(
+            'SELECT idusuario FROM usuario WHERE cpf = ?',
+            [userData.cpf]
+        );
+        if (existingCpf.length > 0) {
+            return res.status(409).json({ erro: 'CPF já cadastrado' });
         }
 
         // Hash da senha
@@ -306,6 +374,8 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
         const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
+        const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
+        const imageExpr = getItemImageExpression(itemSchema);
 
         const [itens] = await connection.query(`
             SELECT 
@@ -314,6 +384,8 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 i.descricao,
                 i.latitude,
                 i.longitude,
+                ${queueLimitExpr} AS limite_fila,
+                ${imageExpr} AS imagem_url,
                 u.primeironome,
                 ${dateExpr} AS dtcriacao,
                 DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes,
@@ -334,7 +406,8 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 status: 'disponível',
                 distancia: Number(calcularDistancia(userLat, userLon, item.latitude, item.longitude).toFixed(2)),
                 dias_restantes: Math.max(0, Number(item.dias_restantes)),
-                total_na_fila: Number(item.total_na_fila || 0)
+                total_na_fila: Number(item.total_na_fila || 0),
+                limite_fila: Number(item.limite_fila || 10)
             }))
             .sort((a, b) => a.distancia - b.distancia);
 
@@ -350,20 +423,16 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
 app.post('/api/itens', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const { titulo, descricao, latitude, longitude, limiteFila, prazo_dias } = req.body;
+        const itemData = normalizeItemPayload(req.body);
 
-        if (!validator.isValidName(titulo) || 
-            !validator.isValidCoordinates(latitude, longitude)) {
+        if (!validator.isValidTitle(itemData.titulo) ||
+            !validator.isValidDescription(itemData.descricao) ||
+            !validator.isValidCoordinates(itemData.latitude, itemData.longitude) ||
+            !validator.isValidQueueLimit(itemData.limite_fila) ||
+            !validator.isValidDeadlineDays(itemData.prazo_dias) ||
+            !validator.isValidImageUrl(itemData.imagem_url)) {
             return res.status(400).json({ erro: 'Dados de item inválidos' });
         }
-
-        const itemData = {
-            titulo: escapeHtml(titulo.trim()),
-            descricao: escapeHtml(descricao?.trim() || ''),
-            latitude: parseFloat(latitude),
-            longitude: parseFloat(longitude),
-            prazo_dias: Math.min(Math.max(parseInt(prazo_dias) || 7, 1), 15)
-        };
 
         connection = await pool.getConnection();
         const [userRows] = await connection.query(
@@ -378,7 +447,7 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
         const itemSchema = await getItemSchemaSupport(connection);
         const columns = ['titulo', 'descricao'];
         const values = ['?', '?'];
-        const insertParams = [itemData.titulo, itemData.descricao];
+        const insertParams = [escapeHtml(itemData.titulo), escapeHtml(itemData.descricao)];
 
         if (itemSchema.hasDtCriacao) {
             columns.push('dtcriacao');
@@ -397,6 +466,16 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
             columns.push('prazo_dias');
             values.push('?');
             insertParams.push(itemData.prazo_dias);
+        }
+        if (itemSchema.hasLimiteFila) {
+            columns.push('limite_fila');
+            values.push('?');
+            insertParams.push(itemData.limite_fila);
+        }
+        if (itemSchema.hasImagemUrl && itemData.imagem_url) {
+            columns.push('imagem_url');
+            values.push('?');
+            insertParams.push(itemData.imagem_url);
         }
 
         const insertSql = `INSERT INTO item (${columns.join(', ')}) VALUES (${values.join(', ')})`;
@@ -421,6 +500,8 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
         connection = await pool.getConnection();
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
+        const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
+        const imageExpr = getItemImageExpression(itemSchema);
         const [itens] = await connection.query(`
             SELECT 
                 i.iditem,
@@ -428,6 +509,8 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                 i.descricao,
                 i.latitude,
                 i.longitude,
+                ${queueLimitExpr} AS limite_fila,
+                ${imageExpr} AS imagem_url,
                 ${dateExpr} AS dtcriacao,
                 (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila,
                 (SELECT COUNT(*) FROM solicitacao s3 WHERE s3.item_iditem = i.iditem) AS total_solicitacoes
@@ -438,6 +521,152 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
         res.json(itens);
     } catch (error) {
         handleError(res, 500, 'Erro ao listar meus itens', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Detalhar item
+app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const { iditem } = req.params;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
+        const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
+        const imageExpr = getItemImageExpression(itemSchema);
+        const [rows] = await connection.query(`
+            SELECT
+                i.iditem,
+                i.titulo,
+                i.descricao,
+                i.latitude,
+                i.longitude,
+                i.usuario_idusuario,
+                ${queueLimitExpr} AS limite_fila,
+                ${imageExpr} AS imagem_url,
+                ${dateExpr} AS dtcriacao,
+                u.primeironome
+            FROM item i
+            JOIN usuario u ON i.usuario_idusuario = u.idusuario
+            WHERE i.iditem = ?
+        `, [iditem]);
+
+        if (rows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+
+        res.json(rows[0]);
+    } catch (error) {
+        handleError(res, 500, 'Erro ao carregar item', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Atualizar item de doação
+app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const { iditem } = req.params;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        const itemData = normalizeItemPayload(req.body);
+        if (!validator.isValidTitle(itemData.titulo) ||
+            !validator.isValidDescription(itemData.descricao) ||
+            !validator.isValidCoordinates(itemData.latitude, itemData.longitude) ||
+            !validator.isValidQueueLimit(itemData.limite_fila) ||
+            !validator.isValidDeadlineDays(itemData.prazo_dias) ||
+            !validator.isValidImageUrl(itemData.imagem_url)) {
+            return res.status(400).json({ erro: 'Dados de item inválidos' });
+        }
+
+        connection = await pool.getConnection();
+        const [itemRows] = await connection.query(
+            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            [iditem]
+        );
+
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+        if (Number(itemRows[0].usuario_idusuario) !== Number(req.user.idusuario)) {
+            return res.status(403).json({ erro: 'Você não tem permissão para editar este item' });
+        }
+
+        const [blocked] = await connection.query(
+            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aguardando_entrega', 'aceito', 'em_processo', 'entregue') LIMIT 1",
+            [iditem]
+        );
+        if (blocked.length > 0) {
+            return res.status(409).json({ erro: 'Não é possível editar um item reservado ou entregue' });
+        }
+
+        const itemSchema = await getItemSchemaSupport(connection);
+        const assignments = ['titulo = ?', 'descricao = ?', 'latitude = ?', 'longitude = ?'];
+        const params = [
+            escapeHtml(itemData.titulo),
+            escapeHtml(itemData.descricao),
+            itemData.latitude,
+            itemData.longitude
+        ];
+
+        if (itemSchema.hasPrazoDias) {
+            assignments.push('prazo_dias = ?');
+            params.push(itemData.prazo_dias);
+        }
+        if (itemSchema.hasLimiteFila) {
+            assignments.push('limite_fila = ?');
+            params.push(itemData.limite_fila);
+        }
+        if (itemSchema.hasImagemUrl) {
+            assignments.push('imagem_url = ?');
+            params.push(itemData.imagem_url || null);
+        }
+
+        params.push(iditem);
+        await connection.query(`UPDATE item SET ${assignments.join(', ')} WHERE iditem = ?`, params);
+        res.json({ sucesso: true });
+    } catch (error) {
+        handleError(res, 500, 'Erro ao atualizar item', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Excluir item de doação
+app.delete('/api/itens/:iditem', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const { iditem } = req.params;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        connection = await pool.getConnection();
+        const [itemRows] = await connection.query(
+            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            [iditem]
+        );
+
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+        if (Number(itemRows[0].usuario_idusuario) !== Number(req.user.idusuario)) {
+            return res.status(403).json({ erro: 'Você não tem permissão para excluir este item' });
+        }
+
+        await connection.query('DELETE FROM item WHERE iditem = ?', [iditem]);
+        res.json({ sucesso: true });
+    } catch (error) {
+        handleError(res, 500, 'Erro ao excluir item', error);
     } finally {
         if (connection) connection.release();
     }
@@ -454,10 +683,12 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
 
         // Verificar item
         const [itens] = await connection.query(
-            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            `SELECT usuario_idusuario, ${queueLimitExpr} AS limite_fila FROM item i WHERE iditem = ?`,
             [iditem]
         );
 
@@ -471,7 +702,7 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
 
         // Verificar se já existe item aceito ou entregue
         const [itemStatus] = await connection.query(
-            'SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ("aceito", "entregue") LIMIT 1',
+            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue') LIMIT 1",
             [iditem]
         );
 
@@ -484,31 +715,43 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
             [iditem]
         );
 
-        if (count[0].total >= 10) {
-            return res.status(409).json({ erro: 'Fila cheia. Este item já tem 10 solicitações pendentes.' });
+        const limiteFila = Number(itens[0].limite_fila || 10);
+        if (count[0].total >= limiteFila) {
+            return res.status(409).json({ erro: `Fila cheia. Este item já tem ${limiteFila} solicitações pendentes.` });
         }
 
-        // Verificar solicitação duplicada (por constraint unique do banco)
-        // A constraint key 'solicitacao.unique_solicitacao' trava a combinação (item_iditem, usuario_idusuario)
-        // independentemente do status. Então bloqueamos qualquer ocorrência existente.
+        // Verificar solicitação existente (por constraint unique do banco)
+        // Se existir uma solicitação cancelada, permite re-solicitar via UPDATE
+        // Se existir uma solicitação pendente/ativa, bloqueia
         const [existing] = await connection.query(
-            'SELECT idsolicitacao FROM solicitacao WHERE item_iditem = ? AND usuario_idusuario = ? LIMIT 1',
+            'SELECT idsolicitacao, status FROM solicitacao WHERE item_iditem = ? AND usuario_idusuario = ? LIMIT 1',
             [iditem, req.user.idusuario]
         );
+
+        let idsolicitacao;
 
         if (existing.length > 0) {
-            return res.status(400).json({ erro: 'Você já solicitou este item' });
+            if (existing[0].status !== 'cancelado') {
+                return res.status(400).json({ erro: 'Você já solicitou este item' });
+            }
+            // Row cancelada: reutilizar via UPDATE para contornar a UNIQUE constraint
+            await connection.query(
+                'UPDATE solicitacao SET status = \'pendente\', datarequisicao = NOW() WHERE idsolicitacao = ?',
+                [existing[0].idsolicitacao]
+            );
+            idsolicitacao = existing[0].idsolicitacao;
+        } else {
+            // Criar nova solicitação
+            const [result] = await connection.query(
+                'INSERT INTO solicitacao (item_iditem, usuario_idusuario, datarequisicao, status) VALUES (?, ?, NOW(), "pendente")',
+                [iditem, req.user.idusuario]
+            );
+            idsolicitacao = result.insertId;
         }
-
-        // Criar solicitação
-        const [result] = await connection.query(
-            'INSERT INTO solicitacao (item_iditem, usuario_idusuario, datarequisicao, status) VALUES (?, ?, NOW(), "pendente")',
-            [iditem, req.user.idusuario]
-        );
 
         res.status(201).json({
             sucesso: true,
-            idsolicitacao: result.insertId
+            idsolicitacao
         });
     } catch (error) {
         handleError(res, 500, 'Erro ao solicitar doação', error);
@@ -559,38 +802,37 @@ app.get('/api/itens/:iditem/fila', authMiddleware, async (req, res) => {
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
         const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
-        const [rows] = await connection.query(`
-            SELECT posicao_fila, total, distancia_km, dias_restantes
-            FROM (
-                SELECT 
-                    s.idsolicitacao,
-                    s.usuario_idusuario,
-                    (6371 * ACOS(
-                        COS(RADIANS(i.latitude)) * COS(RADIANS(u.latitude)) *
-                        COS(RADIANS(u.longitude) - RADIANS(i.longitude)) +
-                        SIN(RADIANS(i.latitude)) * SIN(RADIANS(u.latitude))
-                    )) AS distancia_km,
-                    RANK() OVER (ORDER BY distancia_km ASC) AS posicao_fila,
-                    COUNT(*) OVER () AS total,
-                    DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes
-                FROM solicitacao s
-                JOIN usuario u ON s.usuario_idusuario = u.idusuario
-                JOIN item i ON s.item_iditem = i.iditem
-                WHERE s.item_iditem = ? AND s.status = 'pendente'
-            ) AS fila
-            WHERE usuario_idusuario = ?
-        `, [iditem, req.user.idusuario]);
+        const [itemRows] = await connection.query(`
+            SELECT i.iditem, i.latitude, i.longitude,
+                DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes
+            FROM item i
+            WHERE i.iditem = ?
+        `, [iditem]);
 
-        if (rows.length === 0) {
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+
+        const [candidatos] = await connection.query(`
+            SELECT s.idsolicitacao, s.usuario_idusuario, s.datarequisicao, u.latitude, u.longitude
+            FROM solicitacao s
+            JOIN usuario u ON s.usuario_idusuario = u.idusuario
+            WHERE s.item_iditem = ? AND s.status = 'pendente'
+        `, [iditem]);
+
+        const filaOrdenada = calculateQueueCandidates(itemRows[0], candidatos);
+        const positionIndex = filaOrdenada.findIndex((row) => Number(row.usuario_idusuario) === Number(req.user.idusuario));
+
+        if (positionIndex === -1) {
             return res.status(404).json({ erro: 'Fila não encontrada para este item ou você não está na fila' });
         }
 
-        const fila = rows[0];
+        const fila = filaOrdenada[positionIndex];
         res.json({
-            posicao: fila.posicao_fila,
-            total: fila.total,
+            posicao: positionIndex + 1,
+            total: filaOrdenada.length,
             distancia_km: Number(fila.distancia_km.toFixed(2)),
-            dias_restantes: Math.max(0, fila.dias_restantes)
+            dias_restantes: Math.max(0, Number(itemRows[0].dias_restantes))
         });
     } catch (error) {
         handleError(res, 500, 'Erro ao consultar posição na fila', error);
@@ -604,10 +846,14 @@ app.get('/api/itens/:iditem/fila-detalhada', authMiddleware, async (req, res) =>
     let connection;
     try {
         const { iditem } = req.params;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
         connection = await pool.getConnection();
 
         const [itemRows] = await connection.query(
-            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            'SELECT usuario_idusuario, latitude, longitude FROM item WHERE iditem = ?',
             [iditem]
         );
 
@@ -616,14 +862,22 @@ app.get('/api/itens/:iditem/fila-detalhada', authMiddleware, async (req, res) =>
         }
 
         const [fila] = await connection.query(`
-            SELECT u.idusuario, u.primeironome, s.idsolicitacao, s.datarequisicao
+            SELECT u.idusuario, u.primeironome, u.latitude, u.longitude, s.idsolicitacao, s.datarequisicao
             FROM solicitacao s
             JOIN usuario u ON s.usuario_idusuario = u.idusuario
             WHERE s.item_iditem = ? AND s.status = 'pendente'
-            ORDER BY s.datarequisicao ASC
         `, [iditem]);
 
-        res.json(fila);
+        const filaOrdenada = calculateQueueCandidates(itemRows[0], fila).map((row, index) => ({
+            idusuario: row.idusuario,
+            primeironome: row.primeironome,
+            idsolicitacao: row.idsolicitacao,
+            datarequisicao: row.datarequisicao,
+            posicao: index + 1,
+            distancia_km: Number(row.distancia_km.toFixed(2))
+        }));
+
+        res.json(filaOrdenada);
     } catch (error) {
         handleError(res, 500, 'Erro ao carregar fila detalhada', error);
     } finally {
@@ -647,20 +901,14 @@ app.post('/api/itens/:iditem/finalizar', authMiddleware, async (req, res) => {
             return res.status(403).json({ erro: 'Acesso negado' });
         }
 
-        const [candidatos] = await connection.query(`
-            SELECT s.idsolicitacao, s.usuario_idusuario,
-                (6371 * ACOS(
-                    COS(RADIANS(?)) * COS(RADIANS(u.latitude)) *
-                    COS(RADIANS(u.longitude) - RADIANS(?)) +
-                    SIN(RADIANS(?)) * SIN(RADIANS(u.latitude))
-                )) AS distancia_km
+        const [candidatosRows] = await connection.query(`
+            SELECT s.idsolicitacao, s.usuario_idusuario, s.datarequisicao, u.latitude, u.longitude
             FROM solicitacao s
             JOIN usuario u ON s.usuario_idusuario = u.idusuario
             WHERE s.item_iditem = ? AND s.status = 'pendente'
-            ORDER BY distancia_km ASC
-            LIMIT 1
-        `, [itemRows[0].latitude, itemRows[0].longitude, itemRows[0].latitude, iditem]);
+        `, [iditem]);
 
+        const candidatos = calculateQueueCandidates(itemRows[0], candidatosRows);
         if (candidatos.length === 0) {
             return res.status(400).json({ erro: 'Não há interessados na fila' });
         }
@@ -669,7 +917,7 @@ app.post('/api/itens/:iditem/finalizar', authMiddleware, async (req, res) => {
         await connection.beginTransaction();
         try {
             await connection.query(
-                "UPDATE solicitacao SET status = 'aguardando_entrega' WHERE idsolicitacao = ?",
+                "UPDATE solicitacao SET status = 'aguardando_entrega' WHERE idsolicitacao = ? AND status = 'pendente'",
                 [vencedor.idsolicitacao]
             );
             await connection.query(
@@ -681,11 +929,15 @@ app.post('/api/itens/:iditem/finalizar', authMiddleware, async (req, res) => {
                 [iditem]
             );
 
-            // Criar mensagem automática
-            await connection.query(
-                'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                [req.user.idusuario, vencedor.usuario_idusuario, 'Olá! Sua solicitação foi aceita. Vamos combinar a entrega?']
-            );
+            // Criar mensagem automática (não-fatal: banco pode não ter coluna lida ainda)
+            try {
+                await connection.query(
+                    'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
+                    [req.user.idusuario, vencedor.usuario_idusuario, 'Olá! Sua solicitação foi aceita. Vamos combinar a entrega?']
+                );
+            } catch (msgErr) {
+                console.warn('[finalizar] Aviso: não foi possível criar mensagem automática:', msgErr.message);
+            }
 
             await connection.commit();
             res.json({ sucesso: true, idusuario_vencedor: vencedor.usuario_idusuario });
@@ -744,11 +996,15 @@ app.post('/api/aceitar-solicitacao/:idsolicitacao', authMiddleware, async (req, 
                 ['cancelado', solicitacoes[0].item_iditem, idsolicitacao]
             );
 
-            // Criar mensagem automática
-            await connection.query(
-                'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                [doadorId, beneficiarioId, 'Olá! Aceitei sua solicitação. Como podemos combinar a entrega?']
-            );
+            // Criar mensagem automática (não-fatal)
+            try {
+                await connection.query(
+                    'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
+                    [doadorId, beneficiarioId, 'Olá! Aceitei sua solicitação. Como podemos combinar a entrega?']
+                );
+            } catch (msgErr) {
+                console.warn('[aceitar] Aviso: não foi possível criar mensagem automática:', msgErr.message);
+            }
 
             await connection.commit();
             res.json({ sucesso: true });
@@ -947,6 +1203,44 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
     }
 });
 
+// Contar mensagens não lidas (para badge de notificação)
+app.get('/api/mensagens/nao-lidas', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        const [rows] = await connection.query(
+            'SELECT COUNT(*) AS total FROM mensagem WHERE usuario_idusuario1 = ? AND lida = FALSE',
+            [req.user.idusuario]
+        );
+        res.json({ total: Number(rows[0].total) });
+    } catch (error) {
+        handleError(res, 500, 'Erro ao contar mensagens não lidas', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Marcar mensagens de uma conversa como lidas
+app.post('/api/mensagens/marcar-lidas/:idusuario', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const { idusuario } = req.params;
+        if (!validator.isValidID(idusuario)) {
+            return res.status(400).json({ erro: 'ID de usuário inválido' });
+        }
+        connection = await pool.getConnection();
+        await connection.query(
+            'UPDATE mensagem SET lida = TRUE WHERE usuario_idusuario = ? AND usuario_idusuario1 = ? AND lida = FALSE',
+            [idusuario, req.user.idusuario]
+        );
+        res.json({ sucesso: true });
+    } catch (error) {
+        handleError(res, 500, 'Erro ao marcar mensagens como lidas', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 // Listar chats (conversas)
 app.get('/api/chats', authMiddleware, async (req, res) => {
     let connection;
@@ -1016,7 +1310,10 @@ app.get('/api/chat/:idusuario', authMiddleware, async (req, res) => {
 app.post('/api/mensagem', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const { idusuario_destinatario, mensagem } = req.body;
+        const idusuario_destinatario =
+            req.body.idusuario_destinatario || req.body.destinatario_idusuario;
+        const mensagem =
+            req.body.mensagem || req.body.conteudo;
 
         if (!validator.isValidID(idusuario_destinatario) || !validator.isValidMessage(mensagem)) {
             return res.status(400).json({ erro: 'Dados de mensagem inválidos' });
@@ -1059,6 +1356,9 @@ app.post('/api/avaliacao', authMiddleware, async (req, res) => {
 
         res.status(201).json({ sucesso: true, idavaliacao: result.insertId });
     } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ erro: 'Você já avaliou este usuário' });
+        }
         handleError(res, 500, 'Erro ao enviar avaliação', error);
     } finally {
         if (connection) connection.release();
@@ -1087,42 +1387,50 @@ app.get('/api/perfil', authMiddleware, async (req, res) => {
 app.put('/api/perfil', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const body = sanitizeObject(req.body || {});
-        const {
-            primeironome = '',
-            sobrenome = '',
-            ddd = '',
-            telefone = '',
-            logradouro = '',
-            bairro = '',
-            numero = '',
-            cidade = '',
-            estado = '',
-            latitude,
-            longitude
-        } = body;
+        connection = await pool.getConnection();
+        const [current] = await connection.query(
+            'SELECT * FROM usuario WHERE idusuario = ?',
+            [req.user.idusuario]
+        );
+        if (current.length === 0) {
+            return res.status(404).json({ erro: 'Usuário não encontrado' });
+        }
+        const curr = current[0];
 
-        if (!validator.isValidName(primeironome) || !validator.isValidCoordinates(latitude, longitude) || 
-            !validator.isValidStreet(logradouro) || !validator.isValidNumber(numero) || 
+        const body = sanitizeObject(req.body || {});
+
+        const primeironome = body.primeironome || curr.primeironome;
+        const sobrenome    = body.sobrenome    || curr.sobrenome;
+        const ddd          = body.ddd          || curr.ddd;
+        const telefone     = body.telefone     || curr.telefone;
+        const logradouro   = body.logradouro   || curr.logradouro;
+        const bairro       = body.bairro       || curr.bairro;
+        const numero       = body.numero       || curr.numero;
+        const cidade       = body.cidade       || curr.cidade;
+        const estado       = body.estado       || curr.estado;
+        const latitude     = body.latitude  !== undefined ? body.latitude  : curr.latitude;
+        const longitude    = body.longitude !== undefined ? body.longitude : curr.longitude;
+
+        if (!validator.isValidName(primeironome) || !validator.isValidCoordinates(latitude, longitude) ||
+            !validator.isValidStreet(logradouro) || !validator.isValidNumber(numero) ||
             !validator.isValidCity(cidade) || !validator.isValidState(estado) || !validator.isValidDDD(ddd)) {
             return res.status(400).json({ erro: 'Dados de perfil inválidos' });
         }
 
         const userData = {
             primeironome: escapeHtml(normalizeString(primeironome)),
-            sobrenome: escapeHtml(normalizeString(sobrenome)),
-            ddd: normalizeString(ddd),
-            telefone: normalizePhone(telefone),
-            logradouro: escapeHtml(normalizeString(logradouro)),
-            bairro: escapeHtml(normalizeString(bairro)),
-            numero: escapeHtml(normalizeString(numero)),
-            cidade: escapeHtml(normalizeString(cidade)),
-            estado: normalizeState(estado),
-            latitude: parseFloat(latitude),
-            longitude: parseFloat(longitude)
+            sobrenome:    escapeHtml(normalizeString(sobrenome)),
+            ddd:          normalizeString(ddd),
+            telefone:     normalizePhone(telefone),
+            logradouro:   escapeHtml(normalizeString(logradouro)),
+            bairro:       escapeHtml(normalizeString(bairro)),
+            numero:       escapeHtml(normalizeString(numero)),
+            cidade:       escapeHtml(normalizeString(cidade)),
+            estado:       normalizeState(estado),
+            latitude:     parseFloat(latitude),
+            longitude:    parseFloat(longitude)
         };
 
-        connection = await pool.getConnection();
         await connection.query(
             'UPDATE usuario SET primeironome = ?, sobrenome = ?, ddd = ?, telefone = ?, logradouro = ?, bairro = ?, numero = ?, cidade = ?, estado = ?, latitude = ?, longitude = ? WHERE idusuario = ?',
             [userData.primeironome, userData.sobrenome, userData.ddd, userData.telefone, userData.logradouro, userData.bairro, userData.numero, userData.cidade, userData.estado, userData.latitude, userData.longitude, req.user.idusuario]
@@ -1251,11 +1559,15 @@ async function processarFilasExpiradas() {
                         [item.iditem]
                     );
                     
-                    // Chat automático
-                    await connection.query(
-                        'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                        [item.usuario_idusuario, vencedor.usuario_idusuario, 'Olá! O prazo da fila encerrou e você foi selecionado. Como podemos combinar a entrega?']
-                    );
+                    // Chat automático (não-fatal)
+                    try {
+                        await connection.query(
+                            'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
+                            [item.usuario_idusuario, vencedor.usuario_idusuario, 'Olá! O prazo da fila encerrou e você foi selecionado. Como podemos combinar a entrega?']
+                        );
+                    } catch (msgErr) {
+                        console.warn('[processarFilas] Aviso: mensagem automática falhou:', msgErr.message);
+                    }
                 }
 
                 await connection.commit();
@@ -1301,4 +1613,3 @@ if (require.main === module) {
 }
 
 module.exports = { app, processarFilasExpiradas };
-

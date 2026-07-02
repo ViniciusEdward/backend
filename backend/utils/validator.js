@@ -15,6 +15,42 @@
         return typeof name === 'string' && name.trim().length > 0 && name.length <= 50;
     },
 
+    isValidTitle: (title) => {
+        return typeof title === 'string' && title.trim().length >= 2 && title.trim().length <= 150;
+    },
+
+    isValidDescription: (description) => {
+        return typeof description === 'string' && description.trim().length <= 2000;
+    },
+
+    isValidQueueLimit: (limit) => {
+        const parsed = Number(limit);
+        return Number.isInteger(parsed) && parsed >= 1 && parsed <= 15;
+    },
+
+    isValidDeadlineDays: (days) => {
+        const parsed = Number(days);
+        return Number.isInteger(parsed) && parsed >= 1 && parsed <= 15;
+    },
+
+    isValidImageUrl: (url) => {
+        if (url === undefined || url === null || url === '') return true;
+        if (typeof url !== 'string' || url.length > 2048) return false;
+
+        if (url.startsWith('/uploads/')) {
+            return !url.includes('..') && /\.(jpe?g|png|webp|gif)$/i.test(url);
+        }
+
+        // Aceita qualquer URL http/https válida — não exige extensão de imagem
+        // pois muitos serviços (imgur, unsplash, cloudinary, google photos) não usam extensão
+        try {
+            const parsed = new URL(url);
+            return ['http:', 'https:'].includes(parsed.protocol);
+        } catch (error) {
+            return false;
+        }
+    },
+
     // Valida telefone simples
     isValidPhone: (phone) => {
         const digits = typeof phone === 'string' ? phone.replace(/\D/g, '') : '';
@@ -77,6 +113,16 @@
 
     isValidMessage: (message) => {
         return typeof message === 'string' && message.trim().length > 0 && message.trim().length <= 500;
+    },
+
+    isValidComment: (comment) => {
+        return comment === undefined || comment === null ||
+            (typeof comment === 'string' && comment.trim().length <= 1000);
+    },
+
+    isValidRating: (rating) => {
+        const parsed = Number(rating);
+        return Number.isInteger(parsed) && parsed >= 1 && parsed <= 5;
     },
 
     // Limpa strings perigosas

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS item (
     titulo VARCHAR(150) NOT NULL,
     descricao TEXT,
     prazo_dias INT DEFAULT 7,
+    limite_fila INT DEFAULT 10,
+    imagem_url VARCHAR(2048),
     datadoacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     latitude DECIMAL(10, 8),
@@ -123,3 +125,25 @@ GROUP BY u.idusuario;
 
 
 
+
+-- =====================================================
+-- Migration de atualização: adiciona colunas que
+-- podem faltar em bancos criados antes desta versão.
+-- Seguro para executar múltiplas vezes (IF NOT EXISTS
+-- no MySQL 8+ / MariaDB ou verificação manual).
+-- =====================================================
+
+-- Adicionar limite_fila em item (se não existir)
+ALTER TABLE item ADD COLUMN IF NOT EXISTS limite_fila INT DEFAULT 10;
+
+-- Adicionar imagem_url em item (se não existir)
+ALTER TABLE item ADD COLUMN IF NOT EXISTS imagem_url VARCHAR(2048) DEFAULT NULL;
+
+-- Adicionar prazo_dias em item (se não existir)
+ALTER TABLE item ADD COLUMN IF NOT EXISTS prazo_dias INT DEFAULT 7;
+
+-- Adicionar dtcriacao em item (se não existir — bancos antigos podem não ter)
+ALTER TABLE item ADD COLUMN IF NOT EXISTS dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+-- Adicionar lida em mensagem (se não existir — necessário para badge de não lidas)
+ALTER TABLE mensagem ADD COLUMN IF NOT EXISTS lida BOOLEAN DEFAULT FALSE;
