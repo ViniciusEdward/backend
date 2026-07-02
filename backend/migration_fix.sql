@@ -1,47 +1,100 @@
--- =====================================================
--- Doe Fácil — Script de atualização para bancos
--- criados antes da versão atual.
--- Execute uma vez no seu banco:
---   mysql -u root -p dbdoefacil < backend/migration_fix.sql
--- =====================================================
+DROP DATABASE IF EXISTS bpuflqqddr2a5zevg0hj;
+CREATE DATABASE bpuflqqddr2a5zevg0hj CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE bpuflqqddr2a5zevg0hj;
 
--- Corrigir ENUM da coluna status em solicitacao
--- (adiciona 'aguardando_entrega' e outros valores que podem estar faltando)
-ALTER TABLE solicitacao
-    MODIFY COLUMN status ENUM(
-        'pendente',
-        'aceito',
-        'reservado',
-        'aguardando_entrega',
-        'em_processo',
-        'entregue',
-        'cancelado'
-    ) DEFAULT 'pendente';
+CREATE TABLE usuario (
+    idusuario INT PRIMARY KEY AUTO_INCREMENT,
+    primeironome VARCHAR(100) NOT NULL,
+    sobrenome VARCHAR(100) NOT NULL,
+    cpf VARCHAR(14) NOT NULL UNIQUE,
+    ddd VARCHAR(2) NOT NULL,
+    telefone VARCHAR(9) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    senha VARCHAR(255) NOT NULL,
+    estado VARCHAR(2) NOT NULL,
+    cidade VARCHAR(100) NOT NULL,
+    bairro VARCHAR(100) NOT NULL,
+    logradouro VARCHAR(200) NOT NULL,
+    numero VARCHAR(10) NOT NULL,
+    latitude DECIMAL(10,8),
+    longitude DECIMAL(11,8),
+    media_avaliacao DECIMAL(3,2) DEFAULT 0.00,
+    total_avaliacoes INT DEFAULT 0,
+    total_doacoes INT DEFAULT 0,
+    dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    token_recuperacao VARCHAR(255),
+    token_expiracao TIMESTAMP,
+    KEY idx_email (email),
+    KEY idx_cpf (cpf),
+    KEY idx_latitude (latitude),
+    KEY idx_longitude (longitude)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Adicionar coluna `lida` na tabela mensagem (necessário para badge de não lidas)
-ALTER TABLE mensagem ADD COLUMN IF NOT EXISTS lida BOOLEAN DEFAULT FALSE;
+CREATE TABLE item (
+    iditem INT PRIMARY KEY AUTO_INCREMENT,
+    usuario_idusuario INT NOT NULL,
+    titulo VARCHAR(150) NOT NULL,
+    descricao TEXT,
+    prazo_dias INT DEFAULT 7,
+    limite_fila INT DEFAULT 10,
+    imagem_url VARCHAR(2048),
+    datadoacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    latitude DECIMAL(10,8),
+    longitude DECIMAL(11,8),
+    FOREIGN KEY (usuario_idusuario) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    KEY idx_usuario_idusuario (usuario_idusuario),
+    KEY idx_datadoacao (datadoacao),
+    KEY idx_dtcriacao (dtcriacao)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Adicionar coluna `limite_fila` na tabela item (necessário para controle de fila)
-ALTER TABLE item ADD COLUMN IF NOT EXISTS limite_fila INT DEFAULT 10;
+CREATE TABLE item_processamento (
+    iditem INT PRIMARY KEY,
+    processado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (iditem) REFERENCES item(iditem) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Adicionar coluna `imagem_url` na tabela item
-ALTER TABLE item ADD COLUMN IF NOT EXISTS imagem_url VARCHAR(2048) DEFAULT NULL;
+CREATE TABLE solicitacao (
+    idsolicitacao INT PRIMARY KEY AUTO_INCREMENT,
+    item_iditem INT NOT NULL,
+    usuario_idusuario INT NOT NULL,
+    datarequisicao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status ENUM('pendente','aceito','reservado','aguardando_entrega','em_processo','entregue','cancelado') DEFAULT 'pendente',
+    FOREIGN KEY (item_iditem) REFERENCES item(iditem) ON DELETE CASCADE,
+    FOREIGN KEY (usuario_idusuario) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    KEY idx_item_iditem (item_iditem),
+    KEY idx_usuario_idusuario (usuario_idusuario),
+    KEY idx_status (status),
+    UNIQUE KEY unique_solicitacao (item_iditem, usuario_idusuario)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Adicionar coluna `prazo_dias` na tabela item (se não existir)
-ALTER TABLE item ADD COLUMN IF NOT EXISTS prazo_dias INT DEFAULT 7;
+CREATE TABLE mensagem (
+    idmensagem INT PRIMARY KEY AUTO_INCREMENT,
+    usuario_idusuario INT NOT NULL,
+    usuario_idusuario1 INT NOT NULL,
+    conteudo TEXT NOT NULL,
+    dtmensagen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    lida BOOLEAN DEFAULT FALSE,
+    FOREIGN KEY (usuario_idusuario) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    FOREIGN KEY (usuario_idusuario1) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    KEY idx_remetente (usuario_idusuario),
+    KEY idx_destinatario (usuario_idusuario1),
+    KEY idx_dtmensagen (dtmensagen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Adicionar coluna `dtcriacao` na tabela item (se não existir)
-ALTER TABLE item ADD COLUMN IF NOT EXISTS dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+CREATE TABLE avaliacao (
+    idavaliacao INT PRIMARY KEY AUTO_INCREMENT,
+    idusuario_avaliador INT NOT NULL,
+    idusuario_avaliado INT NOT NULL,
+    avaliacao INT CHECK (avaliacao >= 1 AND avaliacao <= 5),
+    comentario TEXT,
+    dataavaliacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (idusuario_avaliador) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    FOREIGN KEY (idusuario_avaliado) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    KEY idx_avaliado (idusuario_avaliado),
+    UNIQUE KEY unique_avaliacao (idusuario_avaliador, idusuario_avaliado)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Verificar resultado
-SELECT 'mensagem.lida' AS coluna, COUNT(*) AS existe
-FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'mensagem' AND COLUMN_NAME = 'lida'
-UNION ALL
-SELECT 'item.limite_fila', COUNT(*)
-FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item' AND COLUMN_NAME = 'limite_fila'
-UNION ALL
-SELECT 'item.imagem_url', COUNT(*)
-FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item' AND COLUMN_NAME = 'imagem_url';
+CREATE INDEX idx_sol_status_data ON solicitacao(status, datarequisicao);
+CREATE INDEX idx_item_coords ON item(latitude, longitude);
+CREATE INDEX idx_usuario_coords ON usuario(latitude, longitude);
