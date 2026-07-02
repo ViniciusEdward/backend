@@ -180,9 +180,12 @@ app.use(cors({
 // Rate limiting global
 app.use('/api/', apiLimiter);
 
-// Servir arquivos estáticos do frontend (apenas se a pasta existir)
+// Servir arquivos estáticos do frontend (apenas se a pasta existir — dev local)
 const frontendPath = path.join(__dirname, '..', 'frontend', 'public');
-app.use(express.static(frontendPath));
+const fs = require('fs');
+if (fs.existsSync(frontendPath)) {
+    app.use(express.static(frontendPath));
+}
 
 // ============= TRATAMENTO DE ERROS =============
 const handleError = (res, statusCode, message, error = null) => {
@@ -306,20 +309,13 @@ app.post('/api/usuarios', async (req, res) => {
 
         // Verificar duplicação
         connection = await pool.getConnection();
-        const [existingEmail] = await connection.query(
-            'SELECT idusuario FROM usuario WHERE email = ?',
-            [userData.email]
+        const [existing] = await connection.query(
+            'SELECT idusuario FROM usuario WHERE email = ? OR cpf = ?',
+            [userData.email, userData.cpf]
         );
-        if (existingEmail.length > 0) {
-            return res.status(409).json({ erro: 'Email já cadastrado' });
-        }
 
-        const [existingCpf] = await connection.query(
-            'SELECT idusuario FROM usuario WHERE cpf = ?',
-            [userData.cpf]
-        );
-        if (existingCpf.length > 0) {
-            return res.status(409).json({ erro: 'CPF já cadastrado' });
+        if (existing.length > 0) {
+            return res.status(400).json({ erro: 'Email ou CPF já cadastrado' });
         }
 
         // Hash da senha
@@ -1310,10 +1306,7 @@ app.get('/api/chat/:idusuario', authMiddleware, async (req, res) => {
 app.post('/api/mensagem', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const idusuario_destinatario =
-            req.body.idusuario_destinatario || req.body.destinatario_idusuario;
-        const mensagem =
-            req.body.mensagem || req.body.conteudo;
+        const { idusuario_destinatario, mensagem } = req.body;
 
         if (!validator.isValidID(idusuario_destinatario) || !validator.isValidMessage(mensagem)) {
             return res.status(400).json({ erro: 'Dados de mensagem inválidos' });
@@ -1356,9 +1349,6 @@ app.post('/api/avaliacao', authMiddleware, async (req, res) => {
 
         res.status(201).json({ sucesso: true, idavaliacao: result.insertId });
     } catch (error) {
-        if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ erro: 'Você já avaliou este usuário' });
-        }
         handleError(res, 500, 'Erro ao enviar avaliação', error);
     } finally {
         if (connection) connection.release();
@@ -1387,50 +1377,42 @@ app.get('/api/perfil', authMiddleware, async (req, res) => {
 app.put('/api/perfil', authMiddleware, async (req, res) => {
     let connection;
     try {
-        connection = await pool.getConnection();
-        const [current] = await connection.query(
-            'SELECT * FROM usuario WHERE idusuario = ?',
-            [req.user.idusuario]
-        );
-        if (current.length === 0) {
-            return res.status(404).json({ erro: 'Usuário não encontrado' });
-        }
-        const curr = current[0];
-
         const body = sanitizeObject(req.body || {});
+        const {
+            primeironome = '',
+            sobrenome = '',
+            ddd = '',
+            telefone = '',
+            logradouro = '',
+            bairro = '',
+            numero = '',
+            cidade = '',
+            estado = '',
+            latitude,
+            longitude
+        } = body;
 
-        const primeironome = body.primeironome || curr.primeironome;
-        const sobrenome    = body.sobrenome    || curr.sobrenome;
-        const ddd          = body.ddd          || curr.ddd;
-        const telefone     = body.telefone     || curr.telefone;
-        const logradouro   = body.logradouro   || curr.logradouro;
-        const bairro       = body.bairro       || curr.bairro;
-        const numero       = body.numero       || curr.numero;
-        const cidade       = body.cidade       || curr.cidade;
-        const estado       = body.estado       || curr.estado;
-        const latitude     = body.latitude  !== undefined ? body.latitude  : curr.latitude;
-        const longitude    = body.longitude !== undefined ? body.longitude : curr.longitude;
-
-        if (!validator.isValidName(primeironome) || !validator.isValidCoordinates(latitude, longitude) ||
-            !validator.isValidStreet(logradouro) || !validator.isValidNumber(numero) ||
+        if (!validator.isValidName(primeironome) || !validator.isValidCoordinates(latitude, longitude) || 
+            !validator.isValidStreet(logradouro) || !validator.isValidNumber(numero) || 
             !validator.isValidCity(cidade) || !validator.isValidState(estado) || !validator.isValidDDD(ddd)) {
             return res.status(400).json({ erro: 'Dados de perfil inválidos' });
         }
 
         const userData = {
             primeironome: escapeHtml(normalizeString(primeironome)),
-            sobrenome:    escapeHtml(normalizeString(sobrenome)),
-            ddd:          normalizeString(ddd),
-            telefone:     normalizePhone(telefone),
-            logradouro:   escapeHtml(normalizeString(logradouro)),
-            bairro:       escapeHtml(normalizeString(bairro)),
-            numero:       escapeHtml(normalizeString(numero)),
-            cidade:       escapeHtml(normalizeString(cidade)),
-            estado:       normalizeState(estado),
-            latitude:     parseFloat(latitude),
-            longitude:    parseFloat(longitude)
+            sobrenome: escapeHtml(normalizeString(sobrenome)),
+            ddd: normalizeString(ddd),
+            telefone: normalizePhone(telefone),
+            logradouro: escapeHtml(normalizeString(logradouro)),
+            bairro: escapeHtml(normalizeString(bairro)),
+            numero: escapeHtml(normalizeString(numero)),
+            cidade: escapeHtml(normalizeString(cidade)),
+            estado: normalizeState(estado),
+            latitude: parseFloat(latitude),
+            longitude: parseFloat(longitude)
         };
 
+        connection = await pool.getConnection();
         await connection.query(
             'UPDATE usuario SET primeironome = ?, sobrenome = ?, ddd = ?, telefone = ?, logradouro = ?, bairro = ?, numero = ?, cidade = ?, estado = ?, latitude = ?, longitude = ? WHERE idusuario = ?',
             [userData.primeironome, userData.sobrenome, userData.ddd, userData.telefone, userData.logradouro, userData.bairro, userData.numero, userData.cidade, userData.estado, userData.latitude, userData.longitude, req.user.idusuario]
@@ -1598,7 +1580,14 @@ app.use((req, res, next) => {
     if (req.path?.startsWith('/api')) {
         return res.status(404).json({ erro: 'Rota não encontrada' });
     }
-    res.sendFile(path.join(__dirname, '..', 'frontend', 'public', 'index.html'));
+    // Em produção o frontend está em outro serviço (Vercel) — não servir index.html
+    const indexPath = path.join(__dirname, '..', 'frontend', 'public', 'index.html');
+    const fs = require('fs');
+    if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+    } else {
+        res.status(200).json({ status: 'DoeFacil API online', docs: '/health' });
+    }
 });
 
 // ============= INICIAR SERVIDOR =============
@@ -1613,3 +1602,4 @@ if (require.main === module) {
 }
 
 module.exports = { app, processarFilasExpiradas };
+
