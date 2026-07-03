@@ -134,8 +134,8 @@ app.use(helmet({
             defaultSrc: ["'self'"],
             scriptSrc: ["'self'", 'https://unpkg.com', 'https://cdnjs.cloudflare.com'],
             styleSrc: ["'self'", 'https://unpkg.com', 'https://cdnjs.cloudflare.com', 'https://fonts.googleapis.com', "'unsafe-inline'"],
-            imgSrc: ["'self'", 'data:', 'https://unpkg.com', 'https://images.unsplash.com', 'https://*.tile.openstreetmap.org', 'https://*.openstreetmap.fr', 'https://*.openstreetmap.de'],
-            connectSrc: ["'self'", 'https://unpkg.com', 'https://nominatim.openstreetmap.org', 'https://*.tile.openstreetmap.org', 'https://*.openstreetmap.fr', 'https://*.openstreetmap.de'],
+            imgSrc: ["'self'", 'data:', 'https:', 'https://unpkg.com', 'https://*.tile.openstreetmap.org', 'https://*.openstreetmap.fr', 'https://*.openstreetmap.de'],
+            connectSrc: ["'self'", 'https://unpkg.com', 'https://nominatim.openstreetmap.org', 'https://*.tile.openstreetmap.org', 'https://*.openstreetmap.fr', 'https://*.openstreetmap.de', 'https://backend-1z9z.onrender.com', 'https://*.vercel.app'],
             fontSrc: ["'self'", 'https://fonts.gstatic.com', 'https://cdnjs.cloudflare.com'],
             objectSrc: ["'none'"],
             frameAncestors: ["'self'"]
