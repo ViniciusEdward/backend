@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
@@ -73,7 +73,18 @@ const getItemSchemaSupport = async (connection) => ({
     hasDtCriacao: await tableColumnExists(connection, 'item', 'dtcriacao'),
     hasDataDoacao: await tableColumnExists(connection, 'item', 'datadoacao'),
     hasLimiteFila: await tableColumnExists(connection, 'item', 'limite_fila'),
-    hasImagemUrl: await tableColumnExists(connection, 'item', 'imagem_url')
+    hasImagemUrl: await tableColumnExists(connection, 'item', 'imagem_url'),
+    hasStatus: await tableColumnExists(connection, 'item', 'status')
+});
+const getUserSchemaSupport = async (connection) => ({
+    hasFotoUrl: await tableColumnExists(connection, 'usuario', 'foto_url'),
+    hasImagemUrl: await tableColumnExists(connection, 'usuario', 'imagem_url'),
+    hasTotalDoacoes: await tableColumnExists(connection, 'usuario', 'total_doacoes')
+});
+const getMessageSchemaSupport = async (connection) => ({
+    hasDtMensagen: await tableColumnExists(connection, 'mensagem', 'dtmensagen'),
+    hasDtMensagem: await tableColumnExists(connection, 'mensagem', 'dtmensagem'),
+    hasLida: await tableColumnExists(connection, 'mensagem', 'lida')
 });
 const getItemDateExpression = ({ hasDtCriacao, hasDataDoacao }) => {
     if (hasDtCriacao && hasDataDoacao) return 'COALESCE(i.dtcriacao, i.datadoacao)';
@@ -82,6 +93,45 @@ const getItemDateExpression = ({ hasDtCriacao, hasDataDoacao }) => {
 };
 const getItemQueueLimitExpression = ({ hasLimiteFila }) => hasLimiteFila ? 'COALESCE(i.limite_fila, 10)' : '10';
 const getItemImageExpression = ({ hasImagemUrl }) => hasImagemUrl ? 'i.imagem_url' : 'NULL';
+const getUserPhotoExpression = ({ hasFotoUrl, hasImagemUrl }) => {
+    if (hasFotoUrl) return 'u.foto_url';
+    if (hasImagemUrl) return 'u.imagem_url';
+    return 'NULL';
+};
+const getMessageDateColumn = ({ hasDtMensagen, hasDtMensagem }) => {
+    if (hasDtMensagen) return 'dtmensagen';
+    if (hasDtMensagem) return 'dtmensagem';
+    return null;
+};
+const getItemStatusExpression = ({ hasStatus }) => {
+    if (hasStatus) return 'COALESCE(i.status, \'disponivel\')';
+    return `CASE
+        WHEN EXISTS (
+            SELECT 1 FROM solicitacao s_status
+            WHERE s_status.item_iditem = i.iditem AND s_status.status = 'entregue'
+        ) THEN 'finalizada'
+        WHEN EXISTS (
+            SELECT 1 FROM solicitacao s_status
+            WHERE s_status.item_iditem = i.iditem
+              AND s_status.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+        ) THEN 'reservada'
+        ELSE 'disponivel'
+    END`;
+};
+const getPublicItemFilter = ({ hasStatus }) => {
+    const statusFilter = hasStatus ? "AND COALESCE(i.status, 'disponivel') = 'disponivel'" : '';
+    return `
+        ${statusFilter}
+        AND NOT EXISTS (
+            SELECT 1 FROM solicitacao s_public
+            WHERE s_public.item_iditem = i.iditem
+              AND s_public.status IN ('aceito', 'entregue', 'aguardando_entrega', 'em_processo')
+        )
+    `;
+};
+const ACCEPTED_STATUSES = ['aceito', 'aguardando_entrega', 'em_processo'];
+const ACTIVE_CHAT_STATUSES = ['aceito', 'aguardando_entrega', 'em_processo'];
+const AUTO_ACCEPT_MESSAGE = 'Sua solicitação foi aceita. Utilize este chat para combinar a retirada da doação.';
 
 const normalizeItemPayload = (body = {}) => {
     const titulo = normalizeString(body.titulo || body.title);
@@ -117,6 +167,211 @@ const calculateQueueCandidates = (item, candidatos) => candidatos
         if (a.distancia_km !== b.distancia_km) return a.distancia_km - b.distancia_km;
         return new Date(a.datarequisicao) - new Date(b.datarequisicao);
     });
+
+const insertChatMessage = async (connection, remetenteId, destinatarioId, conteudo) => {
+    const messageSchema = await getMessageSchemaSupport(connection);
+    const dateColumn = getMessageDateColumn(messageSchema);
+    const columns = ['usuario_idusuario', 'usuario_idusuario1', 'conteudo'];
+    const values = ['?', '?', '?'];
+    const params = [remetenteId, destinatarioId, escapeHtml(String(conteudo).trim())];
+
+    if (dateColumn) {
+        columns.push(`\`${dateColumn}\``);
+        values.push('NOW()');
+    }
+    if (messageSchema.hasLida) {
+        columns.push('lida');
+        values.push('FALSE');
+    }
+
+    const [result] = await connection.query(
+        `INSERT INTO mensagem (${columns.join(', ')}) VALUES (${values.join(', ')})`,
+        params
+    );
+    return result.insertId;
+};
+
+const usersHaveExistingMessages = async (connection, userAId, userBId) => {
+    const [rows] = await connection.query(`
+        SELECT 1
+        FROM mensagem
+        WHERE (
+            (usuario_idusuario = ? AND usuario_idusuario1 = ?)
+            OR (usuario_idusuario = ? AND usuario_idusuario1 = ?)
+        )
+        LIMIT 1
+    `, [userAId, userBId, userBId, userAId]);
+    return rows.length > 0;
+};
+
+const usersHaveDonationRelationship = async (connection, userAId, userBId, statuses = ACTIVE_CHAT_STATUSES) => {
+    const placeholders = statuses.map(() => '?').join(', ');
+    const [rows] = await connection.query(`
+        SELECT 1
+        FROM solicitacao s
+        JOIN item i ON s.item_iditem = i.iditem
+        WHERE s.status IN (${placeholders})
+          AND (
+            (i.usuario_idusuario = ? AND s.usuario_idusuario = ?)
+            OR (i.usuario_idusuario = ? AND s.usuario_idusuario = ?)
+          )
+        LIMIT 1
+    `, [...statuses, userAId, userBId, userBId, userAId]);
+    return rows.length > 0;
+};
+
+const canUsersChat = async (connection, userAId, userBId) => {
+    if (Number(userAId) === Number(userBId)) return false;
+    if (await usersHaveDonationRelationship(connection, userAId, userBId)) return true;
+    return usersHaveExistingMessages(connection, userAId, userBId);
+};
+
+const markItemStatus = async (connection, iditem, status) => {
+    const itemSchema = await getItemSchemaSupport(connection);
+    if (itemSchema.hasStatus) {
+        await connection.query('UPDATE item SET status = ? WHERE iditem = ?', [status, iditem]);
+    }
+};
+
+const incrementDonorStats = async (connection, doadorId) => {
+    const userSchema = await getUserSchemaSupport(connection);
+    if (userSchema.hasTotalDoacoes) {
+        await connection.query('UPDATE usuario SET total_doacoes = COALESCE(total_doacoes, 0) + 1 WHERE idusuario = ?', [doadorId]);
+    }
+};
+
+const registerItemProcessing = async (connection, iditem) => {
+    await connection.query(
+        'INSERT INTO item_processamento (iditem) VALUES (?) ON DUPLICATE KEY UPDATE processado_em = NOW()',
+        [iditem]
+    );
+};
+
+const acceptSolicitation = async (connection, solicitacao, doadorId) => {
+    const idsolicitacao = Number(solicitacao.idsolicitacao);
+    const iditem = Number(solicitacao.item_iditem);
+    const beneficiarioId = Number(solicitacao.beneficiario || solicitacao.usuario_idusuario);
+
+    const [updateResult] = await connection.query(
+        "UPDATE solicitacao SET status = 'aguardando_entrega' WHERE idsolicitacao = ? AND status = 'pendente'",
+        [idsolicitacao]
+    );
+
+    if (updateResult.affectedRows === 0) {
+        const [current] = await connection.query('SELECT status FROM solicitacao WHERE idsolicitacao = ?', [idsolicitacao]);
+        const currentStatus = current[0]?.status;
+        if (!ACCEPTED_STATUSES.includes(currentStatus)) {
+            const error = new Error('Solicitação não está pendente');
+            error.statusCode = 409;
+            throw error;
+        }
+    }
+
+    await connection.query(
+        "UPDATE solicitacao SET status = 'cancelado' WHERE item_iditem = ? AND idsolicitacao != ? AND status = 'pendente'",
+        [iditem, idsolicitacao]
+    );
+    await markItemStatus(connection, iditem, 'reservada');
+    await registerItemProcessing(connection, iditem);
+    await insertChatMessage(connection, doadorId, beneficiarioId, AUTO_ACCEPT_MESSAGE);
+
+    return { iditem, beneficiarioId, idsolicitacao };
+};
+
+const finalizeAcceptedDonation = async (connection, item, solicitacao) => {
+    const iditem = Number(item.iditem);
+    const doadorId = Number(item.usuario_idusuario);
+    const idsolicitacao = Number(solicitacao.idsolicitacao);
+    const beneficiarioId = Number(solicitacao.usuario_idusuario);
+
+    await connection.query(
+        "UPDATE solicitacao SET status = 'entregue' WHERE idsolicitacao = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo')",
+        [idsolicitacao]
+    );
+    await markItemStatus(connection, iditem, 'finalizada');
+    await registerItemProcessing(connection, iditem);
+    await incrementDonorStats(connection, doadorId);
+
+    return { iditem, doadorId, beneficiarioId, idsolicitacao };
+};
+
+const runFinalizeItemFlow = async (connection, iditem, usuarioId) => {
+    const itemSchema = await getItemSchemaSupport(connection);
+    const statusExpr = getItemStatusExpression(itemSchema);
+
+    const [itemRows] = await connection.query(
+        `SELECT iditem, usuario_idusuario, latitude, longitude, ${statusExpr} AS status FROM item i WHERE iditem = ?`,
+        [iditem]
+    );
+
+    if (itemRows.length === 0) {
+        const error = new Error('Item não encontrado');
+        error.statusCode = 404;
+        throw error;
+    }
+    if (Number(itemRows[0].usuario_idusuario) !== Number(usuarioId)) {
+        const error = new Error('Acesso negado');
+        error.statusCode = 403;
+        throw error;
+    }
+
+    await connection.beginTransaction();
+    try {
+        const [acceptedRows] = await connection.query(`
+            SELECT idsolicitacao, item_iditem, usuario_idusuario
+            FROM solicitacao
+            WHERE item_iditem = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo')
+            ORDER BY datarequisicao ASC
+            LIMIT 1
+        `, [iditem]);
+
+        if (acceptedRows.length > 0) {
+            const finalizada = await finalizeAcceptedDonation(connection, itemRows[0], acceptedRows[0]);
+            await connection.commit();
+            return {
+                sucesso: true,
+                status: 'finalizada',
+                iditem: finalizada.iditem,
+                idsolicitacao: finalizada.idsolicitacao,
+                idusuario_beneficiario: finalizada.beneficiarioId
+            };
+        }
+
+        if (itemRows[0].status === 'finalizada') {
+            const error = new Error('Doação já finalizada');
+            error.statusCode = 409;
+            throw error;
+        }
+
+        const [candidatosRows] = await connection.query(`
+            SELECT s.idsolicitacao, s.item_iditem, s.usuario_idusuario AS beneficiario,
+                s.datarequisicao, u.latitude, u.longitude
+            FROM solicitacao s
+            JOIN usuario u ON s.usuario_idusuario = u.idusuario
+            WHERE s.item_iditem = ? AND s.status = 'pendente'
+        `, [iditem]);
+
+        const candidatos = calculateQueueCandidates(itemRows[0], candidatosRows);
+        if (candidatos.length === 0) {
+            const error = new Error('Não há interessados na fila');
+            error.statusCode = 400;
+            throw error;
+        }
+
+        const aceita = await acceptSolicitation(connection, candidatos[0], usuarioId);
+        await connection.commit();
+        return {
+            sucesso: true,
+            status: 'reservada',
+            iditem: aceita.iditem,
+            idsolicitacao: aceita.idsolicitacao,
+            idusuario_vencedor: aceita.beneficiarioId
+        };
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    }
+};
 
 const cleanupExpiredPasswordResetTokens = () => {
     const now = Date.now();
@@ -180,12 +435,71 @@ app.use(cors({
 // Rate limiting global
 app.use('/api/', apiLimiter);
 
-// Servir arquivos estáticos do frontend (apenas se a pasta existir — dev local)
-const frontendPath = path.join(__dirname, '..', 'frontend', 'public');
 const fs = require('fs');
-if (fs.existsSync(frontendPath)) {
+const uploadsRoot = path.join(__dirname, '..', 'uploads');
+const itemUploadsDir = path.join(uploadsRoot, 'items');
+fs.mkdirSync(itemUploadsDir, { recursive: true });
+
+app.use('/uploads', express.static(uploadsRoot, {
+    index: false,
+    fallthrough: false,
+    maxAge: isProduction ? '7d' : 0,
+    setHeaders: (res) => {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+    }
+}));
+
+const frontendCandidates = [
+    path.join(__dirname, '..', 'frontend_github'),
+    path.join(__dirname, '..', 'frontend', 'public')
+];
+const frontendPath = frontendCandidates.find(candidate => fs.existsSync(candidate));
+if (frontendPath) {
     app.use(express.static(frontendPath));
 }
+
+const IMAGE_MIME_EXTENSION = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp'
+};
+
+const parseDataImage = (value = '') => {
+    if (typeof value !== 'string') return null;
+    const match = value.trim().match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([a-z0-9+/=\s]+)$/i);
+    if (!match) return null;
+    const mime = match[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : match[1].toLowerCase();
+    const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
+    if (!buffer.length || buffer.length > 5 * 1024 * 1024) return null;
+
+    const signature = buffer.subarray(0, 12).toString('hex');
+    const isJpeg = mime === 'image/jpeg' && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    const isPng = mime === 'image/png' && signature.startsWith('89504e470d0a1a0a');
+    const isWebp = mime === 'image/webp' && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+    if (!isJpeg && !isPng && !isWebp) return null;
+
+    return { mime, buffer, extension: IMAGE_MIME_EXTENSION[mime] };
+};
+
+const persistItemImage = async (imageValue = '') => {
+    const value = normalizeString(imageValue);
+    if (!value) return '';
+    if (value.startsWith('/uploads/items/')) return value;
+    if (/^https?:\/\//i.test(value)) return value;
+
+    const parsed = parseDataImage(value);
+    if (!parsed) {
+        const error = new Error('Imagem inválida. Use JPG, PNG ou WebP de até 5 MB.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const filename = `${Date.now()}-${crypto.randomBytes(12).toString('hex')}.${parsed.extension}`;
+    const filepath = path.join(itemUploadsDir, filename);
+    await fs.promises.writeFile(filepath, parsed.buffer, { flag: 'wx', mode: 0o644 });
+    return `/uploads/items/${filename}`;
+};
 
 // ============= TRATAMENTO DE ERROS =============
 const handleError = (res, statusCode, message, error = null) => {
@@ -372,6 +686,8 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
         const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
+        const publicFilter = getPublicItemFilter(itemSchema);
 
         const [itens] = await connection.query(`
             SELECT 
@@ -382,24 +698,22 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 i.longitude,
                 ${queueLimitExpr} AS limite_fila,
                 ${imageExpr} AS imagem_url,
+                ${statusExpr} AS status,
                 u.primeironome,
                 ${dateExpr} AS dtcriacao,
                 DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes,
-                (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila
+                (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila,
+                (SELECT s_user.status FROM solicitacao s_user WHERE s_user.item_iditem = i.iditem AND s_user.usuario_idusuario = ? ORDER BY s_user.datarequisicao DESC LIMIT 1) AS minha_solicitacao_status
             FROM item i
             JOIN usuario u ON i.usuario_idusuario = u.idusuario
             WHERE i.usuario_idusuario != ?
-              AND NOT EXISTS (
-                SELECT 1 FROM solicitacao s
-                WHERE s.item_iditem = i.iditem
-                  AND s.status IN ('aceito', 'entregue', 'aguardando_entrega')
-            )
-        `, [req.user.idusuario]);
+              ${publicFilter}
+        `, [req.user.idusuario, req.user.idusuario]);
 
         const itensComDistancia = itens
             .map(item => ({
                 ...item,
-                status: 'disponível',
+                status: item.status || 'disponivel',
                 distancia: Number(calcularDistancia(userLat, userLon, item.latitude, item.longitude).toFixed(2)),
                 dias_restantes: Math.max(0, Number(item.dias_restantes)),
                 total_na_fila: Number(item.total_na_fila || 0),
@@ -441,6 +755,7 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
         }
 
         const itemSchema = await getItemSchemaSupport(connection);
+        const persistedImagePath = await persistItemImage(itemData.imagem_url);
         const columns = ['titulo', 'descricao'];
         const values = ['?', '?'];
         const insertParams = [escapeHtml(itemData.titulo), escapeHtml(itemData.descricao)];
@@ -468,10 +783,15 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
             values.push('?');
             insertParams.push(itemData.limite_fila);
         }
-        if (itemSchema.hasImagemUrl && itemData.imagem_url) {
+        if (itemSchema.hasImagemUrl && persistedImagePath) {
             columns.push('imagem_url');
             values.push('?');
-            insertParams.push(itemData.imagem_url);
+            insertParams.push(persistedImagePath);
+        }
+        if (itemSchema.hasStatus) {
+            columns.push('status');
+            values.push('?');
+            insertParams.push('disponivel');
         }
 
         const insertSql = `INSERT INTO item (${columns.join(', ')}) VALUES (${values.join(', ')})`;
@@ -483,6 +803,9 @@ app.post('/api/itens', authMiddleware, async (req, res) => {
             iditem: result.insertId
         });
     } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ erro: error.message });
+        }
         handleError(res, 500, 'Erro ao criar item', error);
     } finally {
         if (connection) connection.release();
@@ -498,6 +821,7 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
         const dateExpr = getItemDateExpression(itemSchema);
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
         const [itens] = await connection.query(`
             SELECT 
                 i.iditem,
@@ -507,9 +831,32 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                 i.longitude,
                 ${queueLimitExpr} AS limite_fila,
                 ${imageExpr} AS imagem_url,
+                ${statusExpr} AS status,
                 ${dateExpr} AS dtcriacao,
                 (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila,
-                (SELECT COUNT(*) FROM solicitacao s3 WHERE s3.item_iditem = i.iditem) AS total_solicitacoes
+                (SELECT COUNT(*) FROM solicitacao s3 WHERE s3.item_iditem = i.iditem) AS total_solicitacoes,
+                (
+                    SELECT s4.idsolicitacao
+                    FROM solicitacao s4
+                    WHERE s4.item_iditem = i.iditem AND s4.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    ORDER BY s4.datarequisicao ASC
+                    LIMIT 1
+                ) AS idsolicitacao_aceita,
+                (
+                    SELECT s5.usuario_idusuario
+                    FROM solicitacao s5
+                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    ORDER BY s5.datarequisicao ASC
+                    LIMIT 1
+                ) AS beneficiario_id,
+                (
+                    SELECT u5.primeironome
+                    FROM solicitacao s5
+                    JOIN usuario u5 ON u5.idusuario = s5.usuario_idusuario
+                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    ORDER BY s5.datarequisicao ASC
+                    LIMIT 1
+                ) AS beneficiario_nome
             FROM item i
             WHERE i.usuario_idusuario = ?
             ORDER BY dtcriacao DESC
@@ -536,6 +883,7 @@ app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
         const dateExpr = getItemDateExpression(itemSchema);
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
         const [rows] = await connection.query(`
             SELECT
                 i.iditem,
@@ -546,18 +894,49 @@ app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
                 i.usuario_idusuario,
                 ${queueLimitExpr} AS limite_fila,
                 ${imageExpr} AS imagem_url,
+                ${statusExpr} AS status,
                 ${dateExpr} AS dtcriacao,
-                u.primeironome
+                u.primeironome,
+                (SELECT COUNT(*) FROM solicitacao s2 WHERE s2.item_iditem = i.iditem AND s2.status = 'pendente') AS total_na_fila,
+                (SELECT s_user.status FROM solicitacao s_user WHERE s_user.item_iditem = i.iditem AND s_user.usuario_idusuario = ? ORDER BY s_user.datarequisicao DESC LIMIT 1) AS minha_solicitacao_status,
+                (
+                    SELECT s_acc.usuario_idusuario
+                    FROM solicitacao s_acc
+                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
+                    ORDER BY s_acc.datarequisicao ASC
+                    LIMIT 1
+                ) AS beneficiario_id,
+                (
+                    SELECT s_acc.idsolicitacao
+                    FROM solicitacao s_acc
+                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
+                    ORDER BY s_acc.datarequisicao ASC
+                    LIMIT 1
+                ) AS idsolicitacao_aceita
             FROM item i
             JOIN usuario u ON i.usuario_idusuario = u.idusuario
             WHERE i.iditem = ?
-        `, [iditem]);
+        `, [req.user.idusuario, iditem]);
 
         if (rows.length === 0) {
             return res.status(404).json({ erro: 'Item não encontrado' });
         }
 
-        res.json(rows[0]);
+        const item = rows[0];
+        const usuarioId = Number(req.user.idusuario);
+        const doadorId = Number(item.usuario_idusuario);
+        const beneficiarioId = Number(item.beneficiario_id);
+        const itemReservadoOuFinalizado = ['reservada', 'finalizada'].includes(item.status);
+
+        if (itemReservadoOuFinalizado && usuarioId !== doadorId && usuarioId !== beneficiarioId) {
+            return res.status(403).json({ erro: 'Você não tem acesso a esta doação' });
+        }
+
+        res.json({
+            ...item,
+            total_na_fila: Number(item.total_na_fila || 0),
+            limite_fila: Number(item.limite_fila || 10)
+        });
     } catch (error) {
         handleError(res, 500, 'Erro ao carregar item', error);
     } finally {
@@ -585,8 +964,10 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const statusExpr = getItemStatusExpression(itemSchema);
         const [itemRows] = await connection.query(
-            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            `SELECT usuario_idusuario, ${statusExpr} AS status FROM item i WHERE iditem = ?`,
             [iditem]
         );
 
@@ -597,6 +978,10 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
             return res.status(403).json({ erro: 'Você não tem permissão para editar este item' });
         }
 
+        if (['reservada', 'finalizada'].includes(itemRows[0].status)) {
+            return res.status(409).json({ erro: 'Não é possível editar um item reservado ou finalizado' });
+        }
+
         const [blocked] = await connection.query(
             "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aguardando_entrega', 'aceito', 'em_processo', 'entregue') LIMIT 1",
             [iditem]
@@ -605,7 +990,7 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
             return res.status(409).json({ erro: 'Não é possível editar um item reservado ou entregue' });
         }
 
-        const itemSchema = await getItemSchemaSupport(connection);
+        const persistedImagePath = await persistItemImage(itemData.imagem_url);
         const assignments = ['titulo = ?', 'descricao = ?', 'latitude = ?', 'longitude = ?'];
         const params = [
             escapeHtml(itemData.titulo),
@@ -624,13 +1009,16 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
         }
         if (itemSchema.hasImagemUrl) {
             assignments.push('imagem_url = ?');
-            params.push(itemData.imagem_url || null);
+            params.push(persistedImagePath || null);
         }
 
         params.push(iditem);
         await connection.query(`UPDATE item SET ${assignments.join(', ')} WHERE iditem = ?`, params);
         res.json({ sucesso: true });
     } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ erro: error.message });
+        }
         handleError(res, 500, 'Erro ao atualizar item', error);
     } finally {
         if (connection) connection.release();
@@ -672,7 +1060,7 @@ app.delete('/api/itens/:iditem', authMiddleware, async (req, res) => {
 app.post('/api/solicita', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const { iditem } = req.body;
+        const iditem = req.body?.iditem ?? req.body?.item_iditem ?? req.body?.id_item ?? req.body?.id;
 
         if (!validator.isValidID(iditem)) {
             return res.status(400).json({ erro: 'ID do item inválido' });
@@ -681,10 +1069,11 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
         connection = await pool.getConnection();
         const itemSchema = await getItemSchemaSupport(connection);
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
 
         // Verificar item
         const [itens] = await connection.query(
-            `SELECT usuario_idusuario, ${queueLimitExpr} AS limite_fila FROM item i WHERE iditem = ?`,
+            `SELECT usuario_idusuario, ${queueLimitExpr} AS limite_fila, ${statusExpr} AS status FROM item i WHERE iditem = ?`,
             [iditem]
         );
 
@@ -692,8 +1081,12 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
             return res.status(404).json({ erro: 'Item não encontrado' });
         }
 
-        if (itens[0].usuario_idusuario === req.user.idusuario) {
+        if (Number(itens[0].usuario_idusuario) === Number(req.user.idusuario)) {
             return res.status(400).json({ erro: 'Você não pode solicitar sua própria doação' });
+        }
+
+        if (itens[0].status !== 'disponivel') {
+            return res.status(409).json({ erro: 'Este item não está mais disponível para solicitação.' });
         }
 
         // Verificar se já existe item aceito ou entregue
@@ -853,12 +1246,26 @@ app.get('/api/itens/:iditem/fila-detalhada', authMiddleware, async (req, res) =>
             [iditem]
         );
 
-        if (itemRows.length === 0 || itemRows[0].usuario_idusuario !== req.user.idusuario) {
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+        if (Number(itemRows[0].usuario_idusuario) !== Number(req.user.idusuario)) {
             return res.status(403).json({ erro: 'Acesso negado' });
         }
 
+        const userSchema = await getUserSchemaSupport(connection);
+        const photoExpr = getUserPhotoExpression(userSchema);
         const [fila] = await connection.query(`
-            SELECT u.idusuario, u.primeironome, u.latitude, u.longitude, s.idsolicitacao, s.datarequisicao
+            SELECT
+                u.idusuario,
+                u.primeironome,
+                u.sobrenome,
+                ${photoExpr} AS foto_url,
+                u.latitude,
+                u.longitude,
+                s.idsolicitacao,
+                s.datarequisicao,
+                s.status
             FROM solicitacao s
             JOIN usuario u ON s.usuario_idusuario = u.idusuario
             WHERE s.item_iditem = ? AND s.status = 'pendente'
@@ -867,8 +1274,11 @@ app.get('/api/itens/:iditem/fila-detalhada', authMiddleware, async (req, res) =>
         const filaOrdenada = calculateQueueCandidates(itemRows[0], fila).map((row, index) => ({
             idusuario: row.idusuario,
             primeironome: row.primeironome,
+            sobrenome: row.sobrenome,
+            foto_url: row.foto_url,
             idsolicitacao: row.idsolicitacao,
             datarequisicao: row.datarequisicao,
+            status: row.status,
             posicao: index + 1,
             distancia_km: Number(row.distancia_km.toFixed(2))
         }));
@@ -881,67 +1291,228 @@ app.get('/api/itens/:iditem/fila-detalhada', authMiddleware, async (req, res) =>
     }
 });
 
-// Finalizar doação antecipadamente
-app.post('/api/itens/:iditem/finalizar', authMiddleware, async (req, res) => {
+
+// Fila completa para modal em tempo real no feed e nas telas do item
+app.get('/api/itens/:iditem/fila-completa', authMiddleware, async (req, res) => {
     let connection;
     try {
         const { iditem } = req.params;
-        connection = await pool.getConnection();
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
 
+        connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
+        const imageExpr = getItemImageExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
+
+        const [itemRows] = await connection.query(`
+            SELECT
+                i.iditem,
+                i.titulo,
+                i.descricao,
+                i.usuario_idusuario,
+                i.latitude,
+                i.longitude,
+                ${queueLimitExpr} AS limite_fila,
+                ${imageExpr} AS imagem_url,
+                ${statusExpr} AS status
+            FROM item i
+            WHERE i.iditem = ?
+        `, [iditem]);
+
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
+        }
+
+        const item = itemRows[0];
+        if (item.status !== 'disponivel' && Number(item.usuario_idusuario) !== Number(req.user.idusuario)) {
+            const [relationship] = await connection.query(
+                'SELECT 1 FROM solicitacao WHERE item_iditem = ? AND usuario_idusuario = ? LIMIT 1',
+                [iditem, req.user.idusuario]
+            );
+            if (relationship.length === 0) {
+                return res.status(403).json({ erro: 'Você não tem acesso à fila deste item' });
+            }
+        }
+
+        const [fila] = await connection.query(`
+            SELECT
+                u.idusuario,
+                u.primeironome,
+                u.sobrenome,
+                u.latitude,
+                u.longitude,
+                s.idsolicitacao,
+                s.datarequisicao,
+                s.status
+            FROM solicitacao s
+            JOIN usuario u ON s.usuario_idusuario = u.idusuario
+            WHERE s.item_iditem = ? AND s.status = 'pendente'
+        `, [iditem]);
+
+        const filaOrdenada = calculateQueueCandidates(item, fila).map((row, index) => ({
+            posicao: index + 1,
+            nome: `${row.primeironome || ''} ${row.sobrenome || ''}`.trim() || 'Usuário',
+            datarequisicao: row.datarequisicao,
+            status: row.status,
+            is_me: Number(row.idusuario) === Number(req.user.idusuario)
+        }));
+
+        res.json({
+            item: {
+                iditem: item.iditem,
+                titulo: item.titulo,
+                descricao: item.descricao,
+                imagem_url: item.imagem_url,
+                limite_fila: Number(item.limite_fila || 10),
+                status: item.status || 'disponivel'
+            },
+            total: filaOrdenada.length,
+            fila: filaOrdenada,
+            atualizado_em: new Date().toISOString()
+        });
+    } catch (error) {
+        handleError(res, 500, 'Erro ao carregar fila completa', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+const handleFilaAlias = async (req, res) => {
+    let connection;
+    try {
+        const iditem = req.params.iditem || req.query.iditem;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        connection = await pool.getConnection();
         const [itemRows] = await connection.query(
-            'SELECT usuario_idusuario, latitude, longitude FROM item WHERE iditem = ?',
+            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
             [iditem]
         );
 
-        if (itemRows.length === 0 || itemRows[0].usuario_idusuario !== req.user.idusuario) {
-            return res.status(403).json({ erro: 'Acesso negado' });
+        if (itemRows.length === 0) {
+            return res.status(404).json({ erro: 'Item não encontrado' });
         }
 
-        const [candidatosRows] = await connection.query(`
+        if (Number(itemRows[0].usuario_idusuario) === Number(req.user.idusuario)) {
+            const userSchema = await getUserSchemaSupport(connection);
+            const photoExpr = getUserPhotoExpression(userSchema);
+            const [itemLocationRows] = await connection.query(
+                'SELECT latitude, longitude FROM item WHERE iditem = ?',
+                [iditem]
+            );
+            const [fila] = await connection.query(`
+                SELECT
+                    u.idusuario,
+                    u.primeironome,
+                    u.sobrenome,
+                    ${photoExpr} AS foto_url,
+                    u.latitude,
+                    u.longitude,
+                    s.idsolicitacao,
+                    s.datarequisicao,
+                    s.status
+                FROM solicitacao s
+                JOIN usuario u ON s.usuario_idusuario = u.idusuario
+                WHERE s.item_iditem = ? AND s.status = 'pendente'
+            `, [iditem]);
+
+            const filaOrdenada = calculateQueueCandidates(itemLocationRows[0], fila).map((row, index) => ({
+                idusuario: row.idusuario,
+                primeironome: row.primeironome,
+                sobrenome: row.sobrenome,
+                foto_url: row.foto_url,
+                idsolicitacao: row.idsolicitacao,
+                datarequisicao: row.datarequisicao,
+                status: row.status,
+                posicao: index + 1,
+                distancia_km: Number(row.distancia_km.toFixed(2))
+            }));
+
+            return res.json(filaOrdenada);
+        }
+
+        const itemSchema = await getItemSchemaSupport(connection);
+        const dateExpr = getItemDateExpression(itemSchema);
+        const intervalExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
+        const [itemLocationRows] = await connection.query(`
+            SELECT i.iditem, i.latitude, i.longitude,
+                DATEDIFF(DATE_ADD(${dateExpr}, INTERVAL ${intervalExpr} DAY), NOW()) AS dias_restantes
+            FROM item i
+            WHERE i.iditem = ?
+        `, [iditem]);
+
+        const [candidatos] = await connection.query(`
             SELECT s.idsolicitacao, s.usuario_idusuario, s.datarequisicao, u.latitude, u.longitude
             FROM solicitacao s
             JOIN usuario u ON s.usuario_idusuario = u.idusuario
             WHERE s.item_iditem = ? AND s.status = 'pendente'
         `, [iditem]);
 
-        const candidatos = calculateQueueCandidates(itemRows[0], candidatosRows);
-        if (candidatos.length === 0) {
-            return res.status(400).json({ erro: 'Não há interessados na fila' });
+        const filaOrdenada = calculateQueueCandidates(itemLocationRows[0], candidatos);
+        const positionIndex = filaOrdenada.findIndex((row) => Number(row.usuario_idusuario) === Number(req.user.idusuario));
+        if (positionIndex === -1) {
+            return res.status(404).json({ erro: 'Fila não encontrada para este item ou você não está na fila' });
         }
 
-        const vencedor = candidatos[0];
-        await connection.beginTransaction();
-        try {
-            await connection.query(
-                "UPDATE solicitacao SET status = 'aguardando_entrega' WHERE idsolicitacao = ? AND status = 'pendente'",
-                [vencedor.idsolicitacao]
-            );
-            await connection.query(
-                "UPDATE solicitacao SET status = 'cancelado' WHERE item_iditem = ? AND idsolicitacao != ? AND status = 'pendente'",
-                [iditem, vencedor.idsolicitacao]
-            );
-            await connection.query(
-                'INSERT INTO item_processamento (iditem) VALUES (?) ON DUPLICATE KEY UPDATE processado_em = NOW()',
-                [iditem]
-            );
-
-            // Criar mensagem automática (não-fatal: banco pode não ter coluna lida ainda)
-            try {
-                await connection.query(
-                    'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                    [req.user.idusuario, vencedor.usuario_idusuario, 'Olá! Sua solicitação foi aceita. Vamos combinar a entrega?']
-                );
-            } catch (msgErr) {
-                console.warn('[finalizar] Aviso: não foi possível criar mensagem automática:', msgErr.message);
-            }
-
-            await connection.commit();
-            res.json({ sucesso: true, idusuario_vencedor: vencedor.usuario_idusuario });
-        } catch (e) {
-            await connection.rollback();
-            throw e;
-        }
+        const fila = filaOrdenada[positionIndex];
+        res.json({
+            posicao: positionIndex + 1,
+            total: filaOrdenada.length,
+            distancia_km: Number(fila.distancia_km.toFixed(2)),
+            dias_restantes: Math.max(0, Number(itemLocationRows[0].dias_restantes))
+        });
     } catch (error) {
+        handleError(res, 500, 'Erro ao carregar fila', error);
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
+app.get('/api/fila', authMiddleware, handleFilaAlias);
+app.get('/api/fila/:iditem', authMiddleware, handleFilaAlias);
+
+// Finalizar doação antecipadamente
+app.post('/api/itens/:iditem/finalizar', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const { iditem } = req.params;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        connection = await pool.getConnection();
+        const result = await runFinalizeItemFlow(connection, iditem, req.user.idusuario);
+        res.json(result);
+    } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ erro: error.message });
+        }
+        handleError(res, 500, 'Erro ao finalizar doação', error);
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/finalizar', authMiddleware, async (req, res) => {
+    let connection;
+    try {
+        const iditem = req.body?.iditem ?? req.body?.item_iditem ?? req.query?.iditem;
+        if (!validator.isValidID(iditem)) {
+            return res.status(400).json({ erro: 'ID do item inválido' });
+        }
+
+        connection = await pool.getConnection();
+        const result = await runFinalizeItemFlow(connection, iditem, req.user.idusuario);
+        res.json(result);
+    } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ erro: error.message });
+        }
         handleError(res, 500, 'Erro ao finalizar doação', error);
     } finally {
         if (connection) connection.release();
@@ -962,7 +1533,13 @@ app.post('/api/aceitar-solicitacao/:idsolicitacao', authMiddleware, async (req, 
 
         // Verificar se é o doador
         const [solicitacoes] = await connection.query(`
-            SELECT s.item_iditem, s.usuario_idusuario AS beneficiario, i.usuario_idusuario AS doador FROM solicitacao s
+            SELECT
+                s.idsolicitacao,
+                s.item_iditem,
+                s.usuario_idusuario AS beneficiario,
+                s.status,
+                i.usuario_idusuario AS doador
+            FROM solicitacao s
             JOIN item i ON s.item_iditem = i.iditem
             WHERE s.idsolicitacao = ?
         `, [idsolicitacao]);
@@ -981,31 +1558,20 @@ app.post('/api/aceitar-solicitacao/:idsolicitacao', authMiddleware, async (req, 
 
         await connection.beginTransaction();
         try {
-            // Aceitar e cancelar outras
-            await connection.query(
-                'UPDATE solicitacao SET status = ? WHERE idsolicitacao = ?',
-                ['aguardando_entrega', idsolicitacao]
-            );
-
-            await connection.query(
-                'UPDATE solicitacao SET status = ? WHERE item_iditem = ? AND idsolicitacao != ? AND status = "pendente"',
-                ['cancelado', solicitacoes[0].item_iditem, idsolicitacao]
-            );
-
-            // Criar mensagem automática (não-fatal)
-            try {
-                await connection.query(
-                    'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                    [doadorId, beneficiarioId, 'Olá! Aceitei sua solicitação. Como podemos combinar a entrega?']
-                );
-            } catch (msgErr) {
-                console.warn('[aceitar] Aviso: não foi possível criar mensagem automática:', msgErr.message);
-            }
-
+            const aceita = await acceptSolicitation(connection, solicitacoes[0], doadorId);
             await connection.commit();
-            res.json({ sucesso: true });
+            res.json({
+                sucesso: true,
+                status: 'reservada',
+                iditem: aceita.iditem,
+                idsolicitacao: aceita.idsolicitacao,
+                idusuario_beneficiario: aceita.beneficiarioId
+            });
         } catch (e) {
             await connection.rollback();
+            if (e.statusCode) {
+                return res.status(e.statusCode).json({ erro: e.message });
+            }
             throw e;
         }
     } catch (error) {
@@ -1079,7 +1645,15 @@ app.post('/api/confirmar-entrega/:idsolicitacao', authMiddleware, async (req, re
 
         // Verificar permissão (quem solicitou ou doador)
         const [solicitacoes] = await connection.query(`
-            SELECT s.usuario_idusuario AS solicitante, i.usuario_idusuario AS doador FROM solicitacao s
+            SELECT
+                s.idsolicitacao,
+                s.item_iditem,
+                s.usuario_idusuario AS solicitante,
+                s.usuario_idusuario,
+                s.status,
+                i.iditem,
+                i.usuario_idusuario AS doador
+            FROM solicitacao s
             JOIN item i ON s.item_iditem = i.iditem
             WHERE s.idsolicitacao = ?
         `, [idsolicitacao]);
@@ -1097,13 +1671,31 @@ app.post('/api/confirmar-entrega/:idsolicitacao', authMiddleware, async (req, re
             return res.status(403).json({ erro: 'Você não tem permissão' });
         }
 
-        // Atualizar status
-        await connection.query(
-            'UPDATE solicitacao SET status = ? WHERE idsolicitacao = ?',
-            ['entregue', idsolicitacao]
-        );
+        if (!ACCEPTED_STATUSES.includes(sol.status)) {
+            return res.status(409).json({ erro: 'A doação ainda não está aguardando entrega' });
+        }
 
-        res.json({ sucesso: true });
+        await connection.beginTransaction();
+        try {
+            const item = {
+                iditem: sol.item_iditem,
+                usuario_idusuario: sol.doador
+            };
+            const finalizada = await finalizeAcceptedDonation(connection, item, {
+                idsolicitacao: sol.idsolicitacao,
+                usuario_idusuario: sol.solicitante
+            });
+            await connection.commit();
+            res.json({
+                sucesso: true,
+                status: 'finalizada',
+                iditem: finalizada.iditem,
+                idsolicitacao: finalizada.idsolicitacao
+            });
+        } catch (e) {
+            await connection.rollback();
+            throw e;
+        }
     } catch (error) {
         handleError(res, 500, 'Erro ao confirmar entrega', error);
     } finally {
@@ -1118,6 +1710,8 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
         connection = await pool.getConnection();
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
+        const imageExpr = getItemImageExpression(itemSchema);
+        const statusExpr = getItemStatusExpression(itemSchema);
 
         const [solicitacoes] = await connection.query(`
             SELECT 
@@ -1128,6 +1722,8 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
                 i.iditem,
                 i.titulo,
                 i.descricao,
+                ${imageExpr} AS imagem_url,
+                ${statusExpr} AS item_status,
                 u.primeironome,
                 u.idusuario as idusuario_doador,
                 NULL as avaliacao,
@@ -1142,10 +1738,12 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
             SELECT
                 'doacao' as tipo,
                 i.iditem as id,
+                i.iditem,
                 ${dateExpr} as data,
-                'criada' as status,
+                ${statusExpr} as status,
                 i.titulo,
                 i.descricao,
+                ${imageExpr} AS imagem_url,
                 NULL as primeironome,
                 NULL as avaliacao,
                 NULL as comentario
@@ -1162,6 +1760,8 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
                 i.iditem,
                 i.titulo,
                 i.descricao,
+                ${imageExpr} AS imagem_url,
+                ${statusExpr} AS item_status,
                 u.primeironome,
                 u.idusuario as idusuario_doador,
                 NULL as avaliacao,
@@ -1169,7 +1769,7 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
             FROM solicitacao s
             JOIN item i ON s.item_iditem = i.iditem
             JOIN usuario u ON i.usuario_idusuario = u.idusuario
-            WHERE (s.usuario_idusuario = ? OR i.usuario_idusuario = ?) AND s.status IN ('aceito', 'entregue')
+            WHERE (s.usuario_idusuario = ? OR i.usuario_idusuario = ?) AND s.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
         `, [req.user.idusuario, req.user.idusuario]);
 
         const [avaliacoes] = await connection.query(`
@@ -1233,6 +1833,10 @@ app.post('/api/mensagens/marcar-lidas/:idusuario', authMiddleware, async (req, r
             return res.status(400).json({ erro: 'ID de usuário inválido' });
         }
         connection = await pool.getConnection();
+        const messageSchema = await getMessageSchemaSupport(connection);
+        if (!messageSchema.hasLida) {
+            return res.json({ sucesso: true });
+        }
         await connection.query(
             'UPDATE mensagem SET lida = TRUE WHERE usuario_idusuario = ? AND usuario_idusuario1 = ? AND lida = FALSE',
             [idusuario, req.user.idusuario]
@@ -1250,18 +1854,22 @@ app.get('/api/chats', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+        const messageSchema = await getMessageSchemaSupport(connection);
+        const dateColumn = getMessageDateColumn(messageSchema);
+        const lastMessageExpr = dateColumn ? `MAX(m.\`${dateColumn}\`)` : 'NOW()';
 
         // Consulta robusta que funciona em MySQL 5.7 e 8.0 (evita problemas de ONLY_FULL_GROUP_BY)
         const [chats] = await connection.query(`
             SELECT 
                 u.idusuario AS idusuario_outro,
                 u.primeironome,
-                MAX(m.dtmensagen) AS ultima_mensagem
+                ${lastMessageExpr} AS ultima_mensagem,
+                MAX(m.idmensagem) AS ultima_ordem
             FROM mensagem m
             JOIN usuario u ON u.idusuario = (CASE WHEN m.usuario_idusuario = ? THEN m.usuario_idusuario1 ELSE m.usuario_idusuario END)
             WHERE m.usuario_idusuario = ? OR m.usuario_idusuario1 = ?
             GROUP BY u.idusuario, u.primeironome
-            ORDER BY ultima_mensagem DESC
+            ORDER BY ultima_ordem DESC
         `, [req.user.idusuario, req.user.idusuario, req.user.idusuario]);
 
         res.json(chats || []);
@@ -1284,13 +1892,26 @@ app.get('/api/chat/:idusuario', authMiddleware, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        const [usuarios] = await connection.query('SELECT idusuario FROM usuario WHERE idusuario = ?', [idusuario]);
+        if (usuarios.length === 0) {
+            return res.status(404).json({ erro: 'Usuário não encontrado' });
+        }
+
+        if (!(await canUsersChat(connection, req.user.idusuario, idusuario))) {
+            return res.status(403).json({ erro: 'Chat indisponível para estes usuários' });
+        }
+
+        const messageSchema = await getMessageSchemaSupport(connection);
+        const dateColumn = getMessageDateColumn(messageSchema);
+        const dateSelect = dateColumn ? `m.\`${dateColumn}\`` : 'NULL';
+        const orderExpr = dateColumn ? `m.\`${dateColumn}\` ASC, m.idmensagem ASC` : 'm.idmensagem ASC';
 
         const [mensagens] = await connection.query(`
             SELECT 
                 m.idmensagem,
                 m.usuario_idusuario AS idusuario_remetente,
                 m.conteudo AS mensagem,
-                m.dtmensagen AS data,
+                ${dateSelect} AS data,
                 u.primeironome
             FROM mensagem m
             JOIN usuario u ON m.usuario_idusuario = u.idusuario
@@ -1298,7 +1919,7 @@ app.get('/api/chat/:idusuario', authMiddleware, async (req, res) => {
                 (m.usuario_idusuario = ? AND m.usuario_idusuario1 = ?)
                 OR (m.usuario_idusuario = ? AND m.usuario_idusuario1 = ?)
             )
-            ORDER BY m.dtmensagen ASC
+            ORDER BY ${orderExpr}
             LIMIT 100
         `, [req.user.idusuario, idusuario, idusuario, req.user.idusuario]);
 
@@ -1314,21 +1935,30 @@ app.get('/api/chat/:idusuario', authMiddleware, async (req, res) => {
 app.post('/api/mensagem', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const { idusuario_destinatario, mensagem } = req.body;
+        const idusuario_destinatario = req.body?.idusuario_destinatario ?? req.body?.destinatario_idusuario ?? req.body?.idusuario1 ?? req.body?.destinatarioId;
+        const mensagem = req.body?.mensagem ?? req.body?.conteudo;
 
         if (!validator.isValidID(idusuario_destinatario) || !validator.isValidMessage(mensagem)) {
             return res.status(400).json({ erro: 'Dados de mensagem inválidos' });
         }
 
-        const msgSanitized = escapeHtml(mensagem.trim());
+        if (Number(idusuario_destinatario) === Number(req.user.idusuario)) {
+            return res.status(400).json({ erro: 'Não é possível enviar mensagem para si mesmo' });
+        }
 
         connection = await pool.getConnection();
-        const [result] = await connection.query(
-            'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-            [req.user.idusuario, idusuario_destinatario, msgSanitized]
-        );
+        const [usuarios] = await connection.query('SELECT idusuario FROM usuario WHERE idusuario = ?', [idusuario_destinatario]);
+        if (usuarios.length === 0) {
+            return res.status(404).json({ erro: 'Destinatário não encontrado' });
+        }
 
-        res.status(201).json({ sucesso: true, idmensagem: result.insertId });
+        if (!(await canUsersChat(connection, req.user.idusuario, idusuario_destinatario))) {
+            return res.status(403).json({ erro: 'Chat indisponível para estes usuários' });
+        }
+
+        const idmensagem = await insertChatMessage(connection, req.user.idusuario, idusuario_destinatario, mensagem);
+
+        res.status(201).json({ sucesso: true, idmensagem });
     } catch (error) {
         handleError(res, 500, 'Erro ao enviar mensagem', error);
     } finally {
@@ -1544,20 +2174,9 @@ async function processarFilasExpiradas() {
                         "UPDATE solicitacao SET status = 'cancelado' WHERE item_iditem = ? AND idsolicitacao != ? AND status = 'pendente'",
                         [item.iditem, vencedor.idsolicitacao]
                     );
-                    await connection.query(
-                        'INSERT INTO item_processamento (iditem) VALUES (?) ON DUPLICATE KEY UPDATE processado_em = NOW()',
-                        [item.iditem]
-                    );
-                    
-                    // Chat automático (não-fatal)
-                    try {
-                        await connection.query(
-                            'INSERT INTO mensagem (usuario_idusuario, usuario_idusuario1, conteudo, dtmensagen) VALUES (?, ?, ?, NOW())',
-                            [item.usuario_idusuario, vencedor.usuario_idusuario, 'Olá! O prazo da fila encerrou e você foi selecionado. Como podemos combinar a entrega?']
-                        );
-                    } catch (msgErr) {
-                        console.warn('[processarFilas] Aviso: mensagem automática falhou:', msgErr.message);
-                    }
+                    await markItemStatus(connection, item.iditem, 'reservada');
+                    await registerItemProcessing(connection, item.iditem);
+                    await insertChatMessage(connection, item.usuario_idusuario, vencedor.usuario_idusuario, AUTO_ACCEPT_MESSAGE);
                 }
 
                 await connection.commit();
@@ -1588,10 +2207,8 @@ app.use((req, res, next) => {
     if (req.path?.startsWith('/api')) {
         return res.status(404).json({ erro: 'Rota não encontrada' });
     }
-    // Em produção o frontend está em outro serviço (Vercel) — não servir index.html
-    const indexPath = path.join(__dirname, '..', 'frontend', 'public', 'index.html');
-    const fs = require('fs');
-    if (fs.existsSync(indexPath)) {
+    const indexPath = frontendPath ? path.join(frontendPath, 'index.html') : null;
+    if (indexPath && fs.existsSync(indexPath)) {
         res.sendFile(indexPath);
     } else {
         res.status(200).json({ status: 'DoeFacil API online', docs: '/health' });
@@ -1610,4 +2227,3 @@ if (require.main === module) {
 }
 
 module.exports = { app, processarFilasExpiradas };
-

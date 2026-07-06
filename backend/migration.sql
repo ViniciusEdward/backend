@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS item (
     prazo_dias INT DEFAULT 7,
     limite_fila INT DEFAULT 10,
     imagem_url VARCHAR(2048),
+    status ENUM('disponivel', 'reservada', 'finalizada') DEFAULT 'disponivel',
     datadoacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     latitude DECIMAL(10, 8),
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS item (
     FOREIGN KEY (usuario_idusuario) REFERENCES usuario(idusuario) ON DELETE CASCADE,
     KEY idx_usuario_idusuario (usuario_idusuario),
     KEY idx_datadoacao (datadoacao),
-    KEY idx_dtcriacao (dtcriacao)
+    KEY idx_dtcriacao (dtcriacao),
+    KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS solicitacao (
@@ -138,6 +140,9 @@ ALTER TABLE item ADD COLUMN IF NOT EXISTS limite_fila INT DEFAULT 10;
 
 -- Adicionar imagem_url em item (se não existir)
 ALTER TABLE item ADD COLUMN IF NOT EXISTS imagem_url VARCHAR(2048) DEFAULT NULL;
+
+-- Adicionar status em item (se não existir)
+ALTER TABLE item ADD COLUMN IF NOT EXISTS status ENUM('disponivel', 'reservada', 'finalizada') DEFAULT 'disponivel';
 
 -- Adicionar prazo_dias em item (se não existir)
 ALTER TABLE item ADD COLUMN IF NOT EXISTS prazo_dias INT DEFAULT 7;

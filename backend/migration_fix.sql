@@ -38,6 +38,7 @@ CREATE TABLE item (
     prazo_dias INT DEFAULT 7,
     limite_fila INT DEFAULT 10,
     imagem_url VARCHAR(2048),
+    status ENUM('disponivel','reservada','finalizada') DEFAULT 'disponivel',
     datadoacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     dtcriacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     latitude DECIMAL(10,8),
@@ -45,7 +46,8 @@ CREATE TABLE item (
     FOREIGN KEY (usuario_idusuario) REFERENCES usuario(idusuario) ON DELETE CASCADE,
     KEY idx_usuario_idusuario (usuario_idusuario),
     KEY idx_datadoacao (datadoacao),
-    KEY idx_dtcriacao (dtcriacao)
+    KEY idx_dtcriacao (dtcriacao),
+    KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE item_processamento (

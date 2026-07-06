@@ -1,4 +1,4 @@
-﻿const validator = {
+const validator = {
     // Valida email
     isValidEmail: (email) => {
         const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -35,16 +35,25 @@
 
     isValidImageUrl: (url) => {
         if (url === undefined || url === null || url === '') return true;
-        if (typeof url !== 'string' || url.length > 2048) return false;
+        if (typeof url !== 'string') return false;
+        const value = url.trim();
+        if (!value) return true;
 
-        if (url.startsWith('/uploads/')) {
-            return !url.includes('..') && /\.(jpe?g|png|webp|gif)$/i.test(url);
+        // Upload local persistido pelo backend.
+        if (value.startsWith('/uploads/items/')) {
+            return !value.includes('..') && /^\/uploads\/items\/[a-z0-9._-]+\.(jpe?g|png|webp)$/i.test(value);
         }
 
-        // Aceita qualquer URL http/https válida — não exige extensão de imagem
-        // pois muitos serviços (imgur, unsplash, cloudinary, google photos) não usam extensão
+        // Upload recebido do frontend como data URL temporária. O backend grava o arquivo e armazena /uploads/...
+        if (/^data:image\/(jpeg|jpg|png|webp);base64,[a-z0-9+/=\s]+$/i.test(value)) {
+            // Mantém a requisição abaixo de ~5 MB de arquivo bruto.
+            return value.length <= 7_000_000;
+        }
+
+        // Mantém compatibilidade com imagens antigas por URL externa, mas bloqueia protocolos inseguros.
+        if (value.length > 2048 || /[<>"'`]/.test(value)) return false;
         try {
-            const parsed = new URL(url);
+            const parsed = new URL(value);
             return ['http:', 'https:'].includes(parsed.protocol);
         } catch (error) {
             return false;
