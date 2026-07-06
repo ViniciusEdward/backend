@@ -1204,11 +1204,19 @@ app.get('/api/mensagens/nao-lidas', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
-        const [rows] = await connection.query(
-            'SELECT COUNT(*) AS total FROM mensagem WHERE usuario_idusuario1 = ? AND lida = FALSE',
-            [req.user.idusuario]
-        );
-        res.json({ total: Number(rows[0].total) });
+        try {
+            const [rows] = await connection.query(
+                'SELECT COUNT(*) AS total FROM mensagem WHERE usuario_idusuario1 = ? AND lida = FALSE',
+                [req.user.idusuario]
+            );
+            res.json({ total: Number(rows[0].total) });
+        } catch (dbError) {
+            // Coluna lida pode não existir em bancos antigos — retorna 0 sem crash
+            if (dbError.code === 'ER_BAD_FIELD_ERROR') {
+                return res.json({ total: 0 });
+            }
+            throw dbError;
+        }
     } catch (error) {
         handleError(res, 500, 'Erro ao contar mensagens não lidas', error);
     } finally {
