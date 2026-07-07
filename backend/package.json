@@ -10,12 +10,12 @@
   "scripts": {
     "start": "node backend/server.js",
     "dev": "nodemon backend/server.js",
-    "test": "jest",
-    "test:unit": "jest tests/unit",
-    "test:integration": "jest tests/integration",
+    "test": "node node_modules/jest/bin/jest.js",
+    "test:unit": "node node_modules/jest/bin/jest.js tests/unit",
+    "test:integration": "node node_modules/jest/bin/jest.js tests/integration",
     "test:qa": "node tests/e2e/doefacil-api-flow.js",
     "test:e2e": "playwright test",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "node node_modules/jest/bin/jest.js --coverage"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -36,8 +36,13 @@
   },
   "jest": {
     "testEnvironment": "node",
-    "testMatch": ["**/tests/**/*.(test|spec).js"],
-    "testPathIgnorePatterns": ["/node_modules/", "/tests/e2e/"],
+    "testMatch": [
+      "**/tests/**/*.(test|spec).js"
+    ],
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/tests/e2e/"
+    ],
     "coverageThreshold": {
       "global": {
         "branches": 60,
