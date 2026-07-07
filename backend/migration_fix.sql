@@ -100,3 +100,16 @@ CREATE TABLE avaliacao (
 CREATE INDEX idx_sol_status_data ON solicitacao(status, datarequisicao);
 CREATE INDEX idx_item_coords ON item(latitude, longitude);
 CREATE INDEX idx_usuario_coords ON usuario(latitude, longitude);
+
+
+-- Campos de avaliação da experiência de entrega (doador e beneficiário)
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS idsolicitacao INT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS iditem INT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS tipo_avaliacao ENUM('doador_avalia_beneficiario', 'beneficiario_avalia_doador_item') DEFAULT 'beneficiario_avalia_doador_item';
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS ocorreu_tudo_bem BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS encontrou_pessoa BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS item_conforme BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS sem_problemas BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS imagem_feedback_url VARCHAR(2048) DEFAULT NULL;
+
+-- Observação: o backend remove automaticamente o índice antigo unique_avaliacao e cria unique_avaliacao_solicitacao_tipo quando inicia ou quando /api/atividades /api/avaliacao é chamado.

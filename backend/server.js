@@ -113,7 +113,7 @@ const getItemStatusExpression = ({ hasStatus }) => {
         WHEN EXISTS (
             SELECT 1 FROM solicitacao s_status
             WHERE s_status.item_iditem = i.iditem
-              AND s_status.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+              AND s_status.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo')
         ) THEN 'reservada'
         ELSE 'disponivel'
     END`;
@@ -125,13 +125,59 @@ const getPublicItemFilter = ({ hasStatus }) => {
         AND NOT EXISTS (
             SELECT 1 FROM solicitacao s_public
             WHERE s_public.item_iditem = i.iditem
-              AND s_public.status IN ('aceito', 'entregue', 'aguardando_entrega', 'em_processo')
+              AND s_public.status IN ('aceito', 'reservado', 'entregue', 'aguardando_entrega', 'em_processo')
         )
     `;
 };
-const ACCEPTED_STATUSES = ['aceito', 'aguardando_entrega', 'em_processo'];
-const ACTIVE_CHAT_STATUSES = ['aceito', 'aguardando_entrega', 'em_processo'];
+const ACCEPTED_STATUSES = ['aceito', 'reservado', 'aguardando_entrega', 'em_processo'];
+// Permite chat assim que existe uma solicitação entre doador e interessado.
+// Antes 'pendente' ficava fora e o frontend recebia 403 ao abrir/enviar chat depois de solicitar.
+const ACTIVE_CHAT_STATUSES = ['pendente', 'aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue'];
 const AUTO_ACCEPT_MESSAGE = 'Sua solicitação foi aceita. Utilize este chat para combinar a retirada da doação.';
+const EVALUATION_TYPES = {
+    DONOR_RATES_BENEFICIARY: 'doador_avalia_beneficiario',
+    BENEFICIARY_RATES_DONOR_ITEM: 'beneficiario_avalia_doador_item'
+};
+
+const tableIndexExists = async (connection, tableName, indexName) => {
+    const [indexes] = await connection.query(`SHOW INDEX FROM \`${tableName}\` WHERE Key_name = ?`, [indexName]);
+    return indexes.length > 0;
+};
+
+const ensureAvaliacaoSchema = async (connection) => {
+    const addColumnIfMissing = async (columnName, definition) => {
+        if (!(await tableColumnExists(connection, 'avaliacao', columnName))) {
+            await connection.query(`ALTER TABLE avaliacao ADD COLUMN ${definition}`);
+        }
+    };
+
+    await addColumnIfMissing('idsolicitacao', 'idsolicitacao INT NULL');
+    await addColumnIfMissing('iditem', 'iditem INT NULL');
+    await addColumnIfMissing('tipo_avaliacao', `tipo_avaliacao ENUM('${EVALUATION_TYPES.DONOR_RATES_BENEFICIARY}', '${EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM}') DEFAULT '${EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM}'`);
+    await addColumnIfMissing('ocorreu_tudo_bem', 'ocorreu_tudo_bem BOOLEAN DEFAULT NULL');
+    await addColumnIfMissing('encontrou_pessoa', 'encontrou_pessoa BOOLEAN DEFAULT NULL');
+    await addColumnIfMissing('item_conforme', 'item_conforme BOOLEAN DEFAULT NULL');
+    await addColumnIfMissing('sem_problemas', 'sem_problemas BOOLEAN DEFAULT NULL');
+    await addColumnIfMissing('imagem_feedback_url', 'imagem_feedback_url VARCHAR(2048) DEFAULT NULL');
+
+    if (await tableIndexExists(connection, 'avaliacao', 'unique_avaliacao')) {
+        await connection.query('ALTER TABLE avaliacao DROP INDEX unique_avaliacao');
+    }
+    if (!(await tableIndexExists(connection, 'avaliacao', 'idx_avaliacao_solicitacao'))) {
+        await connection.query('CREATE INDEX idx_avaliacao_solicitacao ON avaliacao (idsolicitacao)');
+    }
+    if (!(await tableIndexExists(connection, 'avaliacao', 'idx_avaliacao_item'))) {
+        await connection.query('CREATE INDEX idx_avaliacao_item ON avaliacao (iditem)');
+    }
+    if (!(await tableIndexExists(connection, 'avaliacao', 'unique_avaliacao_solicitacao_tipo'))) {
+        await connection.query('CREATE UNIQUE INDEX unique_avaliacao_solicitacao_tipo ON avaliacao (idsolicitacao, tipo_avaliacao, idusuario_avaliador)');
+    }
+};
+
+const toBooleanOrNull = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    return value === true || value === 'true' || value === 1 || value === '1';
+};
 
 const normalizeItemPayload = (body = {}) => {
     const titulo = normalizeString(body.titulo || body.title);
@@ -285,7 +331,7 @@ const finalizeAcceptedDonation = async (connection, item, solicitacao) => {
     const beneficiarioId = Number(solicitacao.usuario_idusuario);
 
     await connection.query(
-        "UPDATE solicitacao SET status = 'entregue' WHERE idsolicitacao = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo')",
+        "UPDATE solicitacao SET status = 'entregue' WHERE idsolicitacao = ? AND status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo')",
         [idsolicitacao]
     );
     await markItemStatus(connection, iditem, 'finalizada');
@@ -320,7 +366,7 @@ const runFinalizeItemFlow = async (connection, iditem, usuarioId) => {
         const [acceptedRows] = await connection.query(`
             SELECT idsolicitacao, item_iditem, usuario_idusuario
             FROM solicitacao
-            WHERE item_iditem = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo')
+            WHERE item_iditem = ? AND status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo')
             ORDER BY datarequisicao ASC
             LIMIT 1
         `, [iditem]);
@@ -333,7 +379,8 @@ const runFinalizeItemFlow = async (connection, iditem, usuarioId) => {
                 status: 'finalizada',
                 iditem: finalizada.iditem,
                 idsolicitacao: finalizada.idsolicitacao,
-                idusuario_beneficiario: finalizada.beneficiarioId
+                idusuario_beneficiario: finalizada.beneficiarioId,
+                idusuario_vencedor: finalizada.beneficiarioId
             };
         }
 
@@ -438,7 +485,9 @@ app.use('/api/', apiLimiter);
 const fs = require('fs');
 const uploadsRoot = path.join(__dirname, '..', 'uploads');
 const itemUploadsDir = path.join(uploadsRoot, 'items');
+const feedbackUploadsDir = path.join(uploadsRoot, 'feedback');
 fs.mkdirSync(itemUploadsDir, { recursive: true });
+fs.mkdirSync(feedbackUploadsDir, { recursive: true });
 
 app.use('/uploads', express.static(uploadsRoot, {
     index: false,
@@ -499,6 +548,31 @@ const persistItemImage = async (imageValue = '') => {
     const filepath = path.join(itemUploadsDir, filename);
     await fs.promises.writeFile(filepath, parsed.buffer, { flag: 'wx', mode: 0o644 });
     return `/uploads/items/${filename}`;
+};
+
+const persistFeedbackImage = async (imageValue = '') => {
+    const value = normalizeString(imageValue);
+    if (!value) return '';
+    if (value.startsWith('/uploads/feedback/')) {
+        if (!/^\/uploads\/feedback\/[a-z0-9._-]+\.(jpe?g|png|webp)$/i.test(value) || value.includes('..')) {
+            const error = new Error('Imagem de feedback inválida.');
+            error.statusCode = 400;
+            throw error;
+        }
+        return value;
+    }
+
+    const parsed = parseDataImage(value);
+    if (!parsed) {
+        const error = new Error('Imagem de feedback inválida. Use JPG, PNG ou WebP de até 5 MB.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const filename = `${Date.now()}-${crypto.randomBytes(12).toString('hex')}.${parsed.extension}`;
+    const filepath = path.join(feedbackUploadsDir, filename);
+    await fs.promises.writeFile(filepath, parsed.buffer, { flag: 'wx', mode: 0o644 });
+    return `/uploads/feedback/${filename}`;
 };
 
 // ============= TRATAMENTO DE ERROS =============
@@ -696,6 +770,7 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 i.descricao,
                 i.latitude,
                 i.longitude,
+                i.usuario_idusuario,
                 ${queueLimitExpr} AS limite_fila,
                 ${imageExpr} AS imagem_url,
                 ${statusExpr} AS status,
@@ -817,6 +892,7 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+        await ensureAvaliacaoSchema(connection);
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
@@ -838,14 +914,14 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                 (
                     SELECT s4.idsolicitacao
                     FROM solicitacao s4
-                    WHERE s4.item_iditem = i.iditem AND s4.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    WHERE s4.item_iditem = i.iditem AND s4.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
                     ORDER BY s4.datarequisicao ASC
                     LIMIT 1
                 ) AS idsolicitacao_aceita,
                 (
                     SELECT s5.usuario_idusuario
                     FROM solicitacao s5
-                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
                     ORDER BY s5.datarequisicao ASC
                     LIMIT 1
                 ) AS beneficiario_id,
@@ -853,14 +929,24 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                     SELECT u5.primeironome
                     FROM solicitacao s5
                     JOIN usuario u5 ON u5.idusuario = s5.usuario_idusuario
-                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'aguardando_entrega', 'em_processo')
+                    WHERE s5.item_iditem = i.iditem AND s5.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
                     ORDER BY s5.datarequisicao ASC
                     LIMIT 1
-                ) AS beneficiario_nome
+                ) AS beneficiario_nome,
+                EXISTS(
+                    SELECT 1
+                    FROM avaliacao a
+                    JOIN solicitacao s6 ON a.idsolicitacao = s6.idsolicitacao
+                    WHERE s6.item_iditem = i.iditem
+                      AND s6.status = 'entregue'
+                      AND a.idusuario_avaliador = ?
+                      AND a.tipo_avaliacao = ?
+                    LIMIT 1
+                ) AS avaliacao_enviada
             FROM item i
             WHERE i.usuario_idusuario = ?
             ORDER BY dtcriacao DESC
-        `, [req.user.idusuario]);
+        `, [req.user.idusuario, EVALUATION_TYPES.DONOR_RATES_BENEFICIARY, req.user.idusuario]);
         res.json(itens);
     } catch (error) {
         handleError(res, 500, 'Erro ao listar meus itens', error);
@@ -902,14 +988,14 @@ app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
                 (
                     SELECT s_acc.usuario_idusuario
                     FROM solicitacao s_acc
-                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
+                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
                     ORDER BY s_acc.datarequisicao ASC
                     LIMIT 1
                 ) AS beneficiario_id,
                 (
                     SELECT s_acc.idsolicitacao
                     FROM solicitacao s_acc
-                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
+                    WHERE s_acc.item_iditem = i.iditem AND s_acc.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
                     ORDER BY s_acc.datarequisicao ASC
                     LIMIT 1
                 ) AS idsolicitacao_aceita
@@ -983,7 +1069,7 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
         }
 
         const [blocked] = await connection.query(
-            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aguardando_entrega', 'aceito', 'em_processo', 'entregue') LIMIT 1",
+            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aguardando_entrega', 'aceito', 'reservado', 'em_processo', 'entregue') LIMIT 1",
             [iditem]
         );
         if (blocked.length > 0) {
@@ -1091,7 +1177,7 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
 
         // Verificar se já existe item aceito ou entregue
         const [itemStatus] = await connection.query(
-            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue') LIMIT 1",
+            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue') LIMIT 1",
             [iditem]
         );
 
@@ -1121,7 +1207,13 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
 
         if (existing.length > 0) {
             if (existing[0].status !== 'cancelado') {
-                return res.status(400).json({ erro: 'Você já solicitou este item' });
+                return res.status(200).json({
+                    sucesso: true,
+                    jaSolicitado: true,
+                    idsolicitacao: existing[0].idsolicitacao,
+                    status: existing[0].status,
+                    mensagem: 'Você já solicitou este item'
+                });
             }
             // Row cancelada: reutilizar via UPDATE para contornar a UNIQUE constraint
             await connection.query(
@@ -1138,7 +1230,7 @@ app.post('/api/solicita', authMiddleware, async (req, res) => {
             idsolicitacao = result.insertId;
         }
 
-        res.status(201).json({
+        res.status(existing.length > 0 ? 200 : 201).json({
             sucesso: true,
             idsolicitacao
         });
@@ -1690,7 +1782,10 @@ app.post('/api/confirmar-entrega/:idsolicitacao', authMiddleware, async (req, re
                 sucesso: true,
                 status: 'finalizada',
                 iditem: finalizada.iditem,
-                idsolicitacao: finalizada.idsolicitacao
+                idsolicitacao: finalizada.idsolicitacao,
+                idusuario_doador: finalizada.doadorId,
+                idusuario_beneficiario: finalizada.beneficiarioId,
+                papel_usuario: Number(req.user.idusuario) === Number(finalizada.doadorId) ? 'doador' : 'beneficiario'
             });
         } catch (e) {
             await connection.rollback();
@@ -1708,10 +1803,12 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+        await ensureAvaliacaoSchema(connection);
         const itemSchema = await getItemSchemaSupport(connection);
         const dateExpr = getItemDateExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
         const statusExpr = getItemStatusExpression(itemSchema);
+        const usuarioId = Number(req.user.idusuario);
 
         const [solicitacoes] = await connection.query(`
             SELECT 
@@ -1726,13 +1823,21 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
                 ${statusExpr} AS item_status,
                 u.primeironome,
                 u.idusuario as idusuario_doador,
+                s.usuario_idusuario as idusuario_beneficiario,
+                NULL as beneficiario_nome,
+                EXISTS(
+                    SELECT 1 FROM avaliacao a
+                    WHERE a.idsolicitacao = s.idsolicitacao
+                      AND a.idusuario_avaliador = ?
+                      AND a.tipo_avaliacao = ?
+                ) as avaliacao_enviada,
                 NULL as avaliacao,
                 NULL as comentario
             FROM solicitacao s
             JOIN item i ON s.item_iditem = i.iditem
             JOIN usuario u ON i.usuario_idusuario = u.idusuario
             WHERE s.usuario_idusuario = ?
-        `, [req.user.idusuario]);
+        `, [usuarioId, EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM, usuarioId]);
 
         const [doacoes] = await connection.query(`
             SELECT
@@ -1744,33 +1849,26 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
                 i.titulo,
                 i.descricao,
                 ${imageExpr} AS imagem_url,
+                s_ent.idsolicitacao,
+                s_ent.status AS entrega_status,
+                b.idusuario as idusuario_beneficiario,
+                b.primeironome as beneficiario_nome,
+                EXISTS(
+                    SELECT 1 FROM avaliacao a
+                    WHERE a.idsolicitacao = s_ent.idsolicitacao
+                      AND a.idusuario_avaliador = ?
+                      AND a.tipo_avaliacao = ?
+                ) as avaliacao_enviada,
                 NULL as primeironome,
                 NULL as avaliacao,
                 NULL as comentario
             FROM item i
+            LEFT JOIN solicitacao s_ent
+                ON s_ent.item_iditem = i.iditem
+               AND s_ent.status IN ('aceito', 'reservado', 'aguardando_entrega', 'em_processo', 'entregue')
+            LEFT JOIN usuario b ON b.idusuario = s_ent.usuario_idusuario
             WHERE i.usuario_idusuario = ?
-        `, [req.user.idusuario]);
-
-        const [entregas] = await connection.query(`
-            SELECT
-                'entrega' as tipo,
-                s.idsolicitacao as id,
-                s.datarequisicao as data,
-                s.status,
-                i.iditem,
-                i.titulo,
-                i.descricao,
-                ${imageExpr} AS imagem_url,
-                ${statusExpr} AS item_status,
-                u.primeironome,
-                u.idusuario as idusuario_doador,
-                NULL as avaliacao,
-                NULL as comentario
-            FROM solicitacao s
-            JOIN item i ON s.item_iditem = i.iditem
-            JOIN usuario u ON i.usuario_idusuario = u.idusuario
-            WHERE (s.usuario_idusuario = ? OR i.usuario_idusuario = ?) AND s.status IN ('aceito', 'aguardando_entrega', 'em_processo', 'entregue')
-        `, [req.user.idusuario, req.user.idusuario]);
+        `, [usuarioId, EVALUATION_TYPES.DONOR_RATES_BENEFICIARY, usuarioId]);
 
         const [avaliacoes] = await connection.query(`
             SELECT 
@@ -1781,15 +1879,22 @@ app.get('/api/atividades', authMiddleware, async (req, res) => {
                 NULL as titulo,
                 NULL as descricao,
                 u.primeironome,
-                NULL as iditem,
+                a.iditem,
+                a.idsolicitacao,
+                a.tipo_avaliacao,
+                a.ocorreu_tudo_bem,
+                a.encontrou_pessoa,
+                a.item_conforme,
+                a.sem_problemas,
+                a.imagem_feedback_url,
                 a.avaliacao,
                 a.comentario
             FROM avaliacao a
             JOIN usuario u ON a.idusuario_avaliado = u.idusuario
             WHERE a.idusuario_avaliador = ?
-        `, [req.user.idusuario]);
+        `, [usuarioId]);
 
-        const atividades = [...doacoes, ...solicitacoes, ...entregas, ...avaliacoes].sort((a, b) => new Date(b.data) - new Date(a.data));
+        const atividades = [...doacoes, ...solicitacoes, ...avaliacoes].sort((a, b) => new Date(b.data) - new Date(a.data));
 
         res.json(atividades);
     } catch (error) {
@@ -1966,27 +2071,164 @@ app.post('/api/mensagem', authMiddleware, async (req, res) => {
     }
 });
 
-// Avaliar usuário
+// Avaliar experiência de doação
 app.post('/api/avaliacao', authMiddleware, async (req, res) => {
     let connection;
     try {
-        const { idusuario_avaliado, avaliacao, comentario } = req.body;
+        const {
+            idusuario_avaliado,
+            idsolicitacao,
+            iditem,
+            tipo_avaliacao,
+            avaliacao,
+            comentario,
+            ocorreu_tudo_bem,
+            encontrou_pessoa,
+            item_conforme,
+            sem_problemas,
+            imagem_feedback_url
+        } = req.body;
 
-        if (!validator.isValidID(idusuario_avaliado) || 
-            !Number.isInteger(avaliacao) || avaliacao < 1 || avaliacao > 5) {
+        const nota = Number(avaliacao);
+        if (!validator.isValidID(idusuario_avaliado) || !Number.isInteger(nota) || nota < 1 || nota > 5) {
             return res.status(400).json({ erro: 'Dados de avaliação inválidos' });
         }
 
-        const comentarioSanitized = escapeHtml(comentario?.trim() || '');
-
         connection = await pool.getConnection();
+        await ensureAvaliacaoSchema(connection);
+
+        const comentarioSanitized = escapeHtml(comentario?.trim() || '');
+        const usuarioId = Number(req.user.idusuario);
+        const avaliadoId = Number(idusuario_avaliado);
+        const tipo = Object.values(EVALUATION_TYPES).includes(tipo_avaliacao)
+            ? tipo_avaliacao
+            : null;
+
+        if (idsolicitacao) {
+            if (!validator.isValidID(idsolicitacao)) {
+                return res.status(400).json({ erro: 'ID de solicitação inválido' });
+            }
+
+            const [solicitacoes] = await connection.query(`
+                SELECT
+                    s.idsolicitacao,
+                    s.item_iditem,
+                    s.usuario_idusuario AS beneficiario,
+                    s.status,
+                    i.usuario_idusuario AS doador
+                FROM solicitacao s
+                JOIN item i ON s.item_iditem = i.iditem
+                WHERE s.idsolicitacao = ?
+            `, [idsolicitacao]);
+
+            if (solicitacoes.length === 0) {
+                return res.status(404).json({ erro: 'Solicitação não encontrada' });
+            }
+
+            const solicitacao = solicitacoes[0];
+            if (solicitacao.status !== 'entregue') {
+                return res.status(409).json({ erro: 'A avaliação só pode ser feita depois da entrega finalizada' });
+            }
+
+            const tipoResolvido = tipo || (
+                usuarioId === Number(solicitacao.doador)
+                    ? EVALUATION_TYPES.DONOR_RATES_BENEFICIARY
+                    : EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM
+            );
+
+            if (tipoResolvido === EVALUATION_TYPES.DONOR_RATES_BENEFICIARY) {
+                if (usuarioId !== Number(solicitacao.doador) || avaliadoId !== Number(solicitacao.beneficiario)) {
+                    return res.status(403).json({ erro: 'Somente o doador pode avaliar o beneficiário desta doação' });
+                }
+            } else if (tipoResolvido === EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM) {
+                if (usuarioId !== Number(solicitacao.beneficiario) || avaliadoId !== Number(solicitacao.doador)) {
+                    return res.status(403).json({ erro: 'Somente o beneficiário pode avaliar o item e o doador desta doação' });
+                }
+            } else {
+                return res.status(400).json({ erro: 'Tipo de avaliação inválido' });
+            }
+
+            const [duplicadas] = await connection.query(`
+                SELECT idavaliacao FROM avaliacao
+                WHERE idsolicitacao = ?
+                  AND tipo_avaliacao = ?
+                  AND idusuario_avaliador = ?
+                LIMIT 1
+            `, [idsolicitacao, tipoResolvido, usuarioId]);
+
+            if (duplicadas.length > 0) {
+                return res.status(409).json({ erro: 'Você já avaliou esta experiência' });
+            }
+
+            const imagemFeedbackPersistida = tipoResolvido === EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM
+                ? await persistFeedbackImage(imagem_feedback_url)
+                : '';
+
+            const [result] = await connection.query(`
+                INSERT INTO avaliacao (
+                    idusuario_avaliador,
+                    idusuario_avaliado,
+                    idsolicitacao,
+                    iditem,
+                    tipo_avaliacao,
+                    avaliacao,
+                    comentario,
+                    ocorreu_tudo_bem,
+                    encontrou_pessoa,
+                    item_conforme,
+                    sem_problemas,
+                    imagem_feedback_url,
+                    dataavaliacao
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            `, [
+                usuarioId,
+                avaliadoId,
+                Number(idsolicitacao),
+                Number(iditem || solicitacao.item_iditem),
+                tipoResolvido,
+                nota,
+                comentarioSanitized,
+                toBooleanOrNull(ocorreu_tudo_bem),
+                toBooleanOrNull(encontrou_pessoa),
+                tipoResolvido === EVALUATION_TYPES.BENEFICIARY_RATES_DONOR_ITEM ? toBooleanOrNull(item_conforme) : null,
+                toBooleanOrNull(sem_problemas),
+                imagemFeedbackPersistida || null
+            ]);
+
+            return res.status(201).json({ sucesso: true, idavaliacao: result.insertId });
+        }
+
+        // Compatibilidade com chamadas antigas sem idsolicitacao.
+        if (usuarioId === avaliadoId) {
+            return res.status(400).json({ erro: 'Você não pode avaliar a si mesmo' });
+        }
+
+        if (!(await usersHaveDonationRelationship(connection, usuarioId, avaliadoId, ['entregue']))) {
+            return res.status(403).json({ erro: 'A avaliação só é permitida após uma doação concluída entre os usuários' });
+        }
+
+        const [duplicadasGenericas] = await connection.query(`
+            SELECT idavaliacao FROM avaliacao
+            WHERE idsolicitacao IS NULL
+              AND idusuario_avaliador = ?
+              AND idusuario_avaliado = ?
+            LIMIT 1
+        `, [usuarioId, avaliadoId]);
+
+        if (duplicadasGenericas.length > 0) {
+            return res.status(409).json({ erro: 'Você já avaliou este usuário' });
+        }
+
         const [result] = await connection.query(
             'INSERT INTO avaliacao (idusuario_avaliador, idusuario_avaliado, avaliacao, comentario, dataavaliacao) VALUES (?, ?, ?, ?, NOW())',
-            [req.user.idusuario, idusuario_avaliado, avaliacao, comentarioSanitized]
+            [usuarioId, avaliadoId, nota, comentarioSanitized]
         );
 
         res.status(201).json({ sucesso: true, idavaliacao: result.insertId });
     } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ erro: 'Você já avaliou esta experiência' });
+        }
         handleError(res, 500, 'Erro ao enviar avaliação', error);
     } finally {
         if (connection) connection.release();
@@ -2193,6 +2435,17 @@ async function processarFilasExpiradas() {
 }
 
 if (require.main === module) {
+    pool.getConnection()
+        .then(async (connection) => {
+            try {
+                await ensureAvaliacaoSchema(connection);
+                console.log('✓ Schema de avaliações verificado');
+            } finally {
+                connection.release();
+            }
+        })
+        .catch((err) => console.error('Erro ao verificar schema de avaliações:', err.message));
+
     setInterval(processarFilasExpiradas, 60 * 60 * 1000);
     processarFilasExpiradas().catch((err) => console.error('Erro inicial ao processar filas expiradas:', err));
 }

@@ -83,13 +83,25 @@ CREATE TABLE IF NOT EXISTS avaliacao (
     idavaliacao INT PRIMARY KEY AUTO_INCREMENT,
     idusuario_avaliador INT NOT NULL,
     idusuario_avaliado INT NOT NULL,
+    idsolicitacao INT NULL,
+    iditem INT NULL,
+    tipo_avaliacao ENUM('doador_avalia_beneficiario', 'beneficiario_avalia_doador_item') DEFAULT 'beneficiario_avalia_doador_item',
     avaliacao INT CHECK (avaliacao >= 1 AND avaliacao <= 5),
     comentario TEXT,
+    ocorreu_tudo_bem BOOLEAN DEFAULT NULL,
+    encontrou_pessoa BOOLEAN DEFAULT NULL,
+    item_conforme BOOLEAN DEFAULT NULL,
+    sem_problemas BOOLEAN DEFAULT NULL,
+    imagem_feedback_url VARCHAR(2048) DEFAULT NULL,
     dataavaliacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (idusuario_avaliador) REFERENCES usuario(idusuario) ON DELETE CASCADE,
     FOREIGN KEY (idusuario_avaliado) REFERENCES usuario(idusuario) ON DELETE CASCADE,
+    FOREIGN KEY (idsolicitacao) REFERENCES solicitacao(idsolicitacao) ON DELETE SET NULL,
+    FOREIGN KEY (iditem) REFERENCES item(iditem) ON DELETE SET NULL,
     KEY idx_avaliado (idusuario_avaliado),
-    UNIQUE KEY unique_avaliacao (idusuario_avaliador, idusuario_avaliado)
+    KEY idx_avaliacao_solicitacao (idsolicitacao),
+    KEY idx_avaliacao_item (iditem),
+    UNIQUE KEY unique_avaliacao_solicitacao_tipo (idsolicitacao, tipo_avaliacao, idusuario_avaliador)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS auditoria_usuarios (
@@ -152,3 +164,13 @@ ALTER TABLE item ADD COLUMN IF NOT EXISTS dtcriacao TIMESTAMP DEFAULT CURRENT_TI
 
 -- Adicionar lida em mensagem (se não existir — necessário para badge de não lidas)
 ALTER TABLE mensagem ADD COLUMN IF NOT EXISTS lida BOOLEAN DEFAULT FALSE;
+
+
+-- Campos de avaliação da experiência de entrega (doador e beneficiário)
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS idsolicitacao INT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS iditem INT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS tipo_avaliacao ENUM('doador_avalia_beneficiario', 'beneficiario_avalia_doador_item') DEFAULT 'beneficiario_avalia_doador_item';
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS ocorreu_tudo_bem BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS encontrou_pessoa BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS item_conforme BOOLEAN DEFAULT NULL;
+ALTER TABLE avaliacao ADD COLUMN IF NOT EXISTS sem_problemas BOOLEAN DEFAULT NULL;
