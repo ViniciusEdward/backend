@@ -431,6 +431,10 @@ const cleanupExpiredPasswordResetTokens = () => {
 
 // ============= MIDDLEWARE DE SEGURANÇA =============
 app.use(helmet({
+    // Permite que o frontend hospedado em outro domínio (Vercel) carregue
+    // imagens estáticas servidas pelo backend (/uploads). Sem isso, o
+    // navegador bloqueia com ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
@@ -458,7 +462,10 @@ const defaultAllowedOrigins = isProduction ? [] : [
     'http://127.0.0.1:5500',
     'http://localhost:5500'
 ];
-const envAllowedOrigins = process.env.CORS_ORIGIN?.split(',').map(origin => origin.trim()).filter(Boolean) || [];
+// Aceita os dois nomes para evitar erro de configuração no Render:
+// CORS_ORIGIN (singular, legado) e CORS_ORIGINS (plural).
+const corsEnvValue = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || '';
+const envAllowedOrigins = corsEnvValue.split(',').map(origin => origin.trim()).filter(Boolean);
 const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...envAllowedOrigins]));
 console.log('✓ Allowed CORS origins:', allowedOrigins);
 
@@ -495,6 +502,9 @@ app.use('/uploads', express.static(uploadsRoot, {
     maxAge: isProduction ? '7d' : 0,
     setHeaders: (res) => {
         res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', isProduction ? 'public, max-age=604800, immutable' : 'no-store');
     }
 }));
 
@@ -2475,7 +2485,7 @@ if (require.main === module) {
         console.log(`✓ Servidor rodando em http://localhost:${PORT}`);
         console.log(`✓ Servidor rodando em http://127.0.0.1:${PORT}`);
         console.log(`✓ Environment: ${process.env.NODE_ENV}`);
-        console.log(`✓ CORS origins: ${process.env.CORS_ORIGIN}`);
+        console.log(`✓ CORS origins: ${corsEnvValue || '(none)'}`);
     });
 }
 
