@@ -429,12 +429,45 @@ const cleanupExpiredPasswordResetTokens = () => {
     }
 };
 
+// ============= ARQUIVOS ESTÁTICOS DE UPLOAD =============
+// Deve vir ANTES do Helmet para evitar Cross-Origin-Resource-Policy: same-origin
+// em imagens consumidas pelo frontend hospedado na Vercel.
+const fs = require('fs');
+const uploadsRoot = path.join(__dirname, '..', 'uploads');
+const itemUploadsDir = path.join(uploadsRoot, 'items');
+const feedbackUploadsDir = path.join(uploadsRoot, 'feedback');
+fs.mkdirSync(itemUploadsDir, { recursive: true });
+fs.mkdirSync(feedbackUploadsDir, { recursive: true });
+
+app.use('/uploads', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+}, express.static(uploadsRoot, {
+    index: false,
+    fallthrough: false,
+    maxAge: isProduction ? '7d' : 0,
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', isProduction ? 'public, max-age=604800, immutable' : 'no-store');
+    }
+}));
+
 // ============= MIDDLEWARE DE SEGURANÇA =============
 app.use(helmet({
-    // Permite que o frontend hospedado em outro domínio (Vercel) carregue
-    // imagens estáticas servidas pelo backend (/uploads). Sem isso, o
-    // navegador bloqueia com ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // Não aplica CORP globalmente. Os arquivos de /uploads são servidos antes
+    // do Helmet, com headers próprios Cross-Origin-Resource-Policy: cross-origin.
+    // Isso evita bloqueio ERR_BLOCKED_BY_RESPONSE.NotSameOrigin na Vercel.
+    crossOriginResourcePolicy: false,
+    crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
@@ -488,25 +521,6 @@ app.use(cors({
 
 // Rate limiting global
 app.use('/api/', apiLimiter);
-
-const fs = require('fs');
-const uploadsRoot = path.join(__dirname, '..', 'uploads');
-const itemUploadsDir = path.join(uploadsRoot, 'items');
-const feedbackUploadsDir = path.join(uploadsRoot, 'feedback');
-fs.mkdirSync(itemUploadsDir, { recursive: true });
-fs.mkdirSync(feedbackUploadsDir, { recursive: true });
-
-app.use('/uploads', express.static(uploadsRoot, {
-    index: false,
-    fallthrough: false,
-    maxAge: isProduction ? '7d' : 0,
-    setHeaders: (res) => {
-        res.setHeader('X-Content-Type-Options', 'nosniff');
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Cache-Control', isProduction ? 'public, max-age=604800, immutable' : 'no-store');
-    }
-}));
 
 const frontendCandidates = [
     path.join(__dirname, '..', 'frontend_github'),
