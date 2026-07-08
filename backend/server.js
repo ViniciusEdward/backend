@@ -785,6 +785,7 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
         const statusExpr = getItemStatusExpression(itemSchema);
+        const prazoExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
         const publicFilter = getPublicItemFilter(itemSchema);
 
         const [itens] = await connection.query(`
@@ -796,6 +797,7 @@ app.get('/api/itens', authMiddleware, async (req, res) => {
                 i.longitude,
                 i.usuario_idusuario,
                 ${queueLimitExpr} AS limite_fila,
+                ${prazoExpr} AS prazo_dias,
                 ${imageExpr} AS imagem_url,
                 ${statusExpr} AS status,
                 u.primeironome,
@@ -922,6 +924,7 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
         const statusExpr = getItemStatusExpression(itemSchema);
+        const prazoExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
         const [itens] = await connection.query(`
             SELECT 
                 i.iditem,
@@ -930,6 +933,7 @@ app.get('/api/itens/minhas', authMiddleware, async (req, res) => {
                 i.latitude,
                 i.longitude,
                 ${queueLimitExpr} AS limite_fila,
+                ${prazoExpr} AS prazo_dias,
                 ${imageExpr} AS imagem_url,
                 ${statusExpr} AS status,
                 ${dateExpr} AS dtcriacao,
@@ -994,6 +998,7 @@ app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
         const queueLimitExpr = getItemQueueLimitExpression(itemSchema);
         const imageExpr = getItemImageExpression(itemSchema);
         const statusExpr = getItemStatusExpression(itemSchema);
+        const prazoExpr = itemSchema.hasPrazoDias ? 'i.prazo_dias' : '7';
         const [rows] = await connection.query(`
             SELECT
                 i.iditem,
@@ -1003,6 +1008,7 @@ app.get('/api/itens/:iditem', authMiddleware, async (req, res) => {
                 i.longitude,
                 i.usuario_idusuario,
                 ${queueLimitExpr} AS limite_fila,
+                ${prazoExpr} AS prazo_dias,
                 ${imageExpr} AS imagem_url,
                 ${statusExpr} AS status,
                 ${dateExpr} AS dtcriacao,
@@ -1135,7 +1141,7 @@ app.put('/api/itens/:iditem', authMiddleware, async (req, res) => {
     }
 });
 
-// Excluir item de doação
+// Excluir/cancelar item de doação
 app.delete('/api/itens/:iditem', authMiddleware, async (req, res) => {
     let connection;
     try {
@@ -1145,8 +1151,10 @@ app.delete('/api/itens/:iditem', authMiddleware, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        const itemSchema = await getItemSchemaSupport(connection);
+        const statusExpr = getItemStatusExpression(itemSchema);
         const [itemRows] = await connection.query(
-            'SELECT usuario_idusuario FROM item WHERE iditem = ?',
+            `SELECT usuario_idusuario, ${statusExpr} AS status FROM item i WHERE iditem = ?`,
             [iditem]
         );
 
@@ -1154,13 +1162,33 @@ app.delete('/api/itens/:iditem', authMiddleware, async (req, res) => {
             return res.status(404).json({ erro: 'Item não encontrado' });
         }
         if (Number(itemRows[0].usuario_idusuario) !== Number(req.user.idusuario)) {
-            return res.status(403).json({ erro: 'Você não tem permissão para excluir este item' });
+            return res.status(403).json({ erro: 'Você não tem permissão para cancelar esta doação' });
         }
 
+        const statusAtual = String(itemRows[0].status || '').toLowerCase();
+        const [entregas] = await connection.query(
+            "SELECT 1 FROM solicitacao WHERE item_iditem = ? AND status = 'entregue' LIMIT 1",
+            [iditem]
+        );
+
+        if (statusAtual === 'finalizada' || entregas.length > 0) {
+            return res.status(409).json({ erro: 'Não é possível cancelar uma doação já finalizada/entregue' });
+        }
+
+        await connection.beginTransaction();
+        await connection.query(
+            "UPDATE solicitacao SET status = 'cancelado' WHERE item_iditem = ? AND status <> 'cancelado'",
+            [iditem]
+        );
         await connection.query('DELETE FROM item WHERE iditem = ?', [iditem]);
-        res.json({ sucesso: true });
+        await connection.commit();
+
+        res.json({ sucesso: true, mensagem: 'Doação cancelada/removida com sucesso' });
     } catch (error) {
-        handleError(res, 500, 'Erro ao excluir item', error);
+        if (connection) {
+            try { await connection.rollback(); } catch (rollbackError) { console.error('Erro ao desfazer cancelamento de doação:', rollbackError); }
+        }
+        handleError(res, 500, 'Erro ao cancelar doação', error);
     } finally {
         if (connection) connection.release();
     }
